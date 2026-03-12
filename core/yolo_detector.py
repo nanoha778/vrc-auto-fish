@@ -123,18 +123,17 @@ class YoloDetector:
         #           max(h,w) <  400px → 向上取整到最近的 32 倍数，最低 320
         _h, _w = img.shape[:2]
         _max_dim = max(_h, _w)
-        # 変更後（軽量寄り）
-        if _max_dim < 400:
-            _infer_size = 320
-        elif _max_dim < 700:
-            _infer_size = 416
-        elif _max_dim < 900:
-            _infer_size = 640
-        else:
-            _infer_size = 720
+        # 推論サイズは固定
+        _infer_size = 416
+
         results = self.model.predict(
-            img, conf=self.conf, device=self._device,
-            verbose=False, imgsz=_infer_size,
+            img,
+            conf=self.conf,
+            device=self._device,
+            verbose=False,
+            imgsz=_infer_size,
+            half=(self._device != "cpu"),
+            max_det=8,
         )
 
         detections = {
