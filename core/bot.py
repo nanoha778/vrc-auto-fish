@@ -12,6 +12,7 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+
 import config
 from core.window import WindowManager
 from core.screen import ScreenCapture
@@ -130,6 +131,15 @@ class FishingBot:
         self._il_device = "cpu"
         self._il_norm_mean = None    # 特征归一化均值
         self._il_norm_std = None     # 特征归一化标准差
+
+        self._pd_writer = None
+        self._pd_file = None
+        self._pd_prev_fish_cy = None
+        self._pd_prev_velocity = 0.0
+        self._pd_log_counter = 0
+        self._pd_last_press = False
+        self._pd_last_hold_decision = 0.0
+
         if config.IL_USE_MODEL:
             self._load_il_policy()
 
@@ -504,7 +514,14 @@ class FishingBot:
     # ══════════════════════════════════════════════════════
 
     def _fishing_minigame(self) -> bool:
-
+        if (
+            config.PD_RECORD
+            and not config.IL_RECORD
+            and not getattr(config, "USE_ADAPTIVE_PD", False)
+            and not config.IL_USE_HYBRID
+            and not config.IL_USE_MODEL
+        ):
+            self._pd_start_recording()
 
         self.state = "小游戏进行中"
         log.info("[🐟 钓鱼] 小游戏开始")
@@ -1231,10 +1248,37 @@ class FishingBot:
                         f"[F{frame:04d}] {fi} | {bi} | {vel} | "
                         f"按住:{hold_count} | 进度:{green:.0%}"
                     )
+                
+                if (
+                    config.PD_RECORD
+                    and not config.IL_RECORD
+                    and not getattr(config, "USE_ADAPTIVE_PD", False)
+                    and not config.IL_USE_HYBRID
+                    and not config.IL_USE_MODEL
+                    and fish is not None
+                    and bar is not None
+                ):
+                    self._pd_record_frame(
+                        frame_idx=frame,
+                        fish=fish,
+                        bar=bar,
+                        pd_press=self._pd_last_press,
+                        pd_hold=self._pd_last_hold_decision,
+                        green=green,
+                    )
 
                 time.sleep(config.GAME_LOOP_INTERVAL)
 
         finally:
+            if (
+                config.PD_RECORD
+                and not config.IL_RECORD
+                and not getattr(config, "USE_ADAPTIVE_PD", False)
+                and not config.IL_USE_HYBRID
+                and not config.IL_USE_MODEL
+            ):
+                self._pd_stop_recording()
+
             if _skip_fish:
                 success = False
                 log.info(
@@ -1251,6 +1295,7 @@ class FishingBot:
                     f"[❌ 失败] 最终进度 {_last_green:.0%} <= "
                     f"{config.SUCCESS_PROGRESS:.0%}，判定失败"
                 )
+            
 
             if config.IL_RECORD:
                 self._il_stop_recording()
@@ -1677,6 +1722,94 @@ class FishingBot:
         self._il_history.clear()
         log.info(f"[IL] 录制开始 → {path}")
 
+    def _pd_start_recording(self):
+        os.makedirs(config.PD_DATA_DIR, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(config.PD_DATA_DIR, f"pd_session_{ts}.csv")
+        self._pd_file = open(path, "w", newline="", encoding="utf-8")
+        self._pd_writer = csv.writer(self._pd_file)
+        self._pd_writer.writerow([
+            "frame", "timestamp",
+            "fish_cy", "bar_cy", "bar_h",
+            "error", "velocity", "fish_delta", "dist_ratio",
+            "mouse_prev",
+            "fish_in_bar", "press_streak",
+            "predicted", "bar_accel",
+            "pd_press", "pd_hold",
+            "green"
+        ])
+        self._pd_prev_fish_cy = None
+        self._pd_prev_velocity = 0.0
+        self._pd_log_counter = 0
+        log.info(f"[PD-REC] 录制开始 → {path}")
+
+    def _pd_stop_recording(self):
+        if self._pd_file:
+            self._pd_file.close()
+            self._pd_file = None
+            self._pd_writer = None
+            log.info("[PD-REC] 录制结束")
+
+    def _pd_build_features(self, fish, bar):
+        fish_cy = fish[1] + fish[3] // 2
+        bar_cy = bar[1] + bar[3] // 2
+        bar_h = max(bar[3], 1)
+        bar_top = bar[1]
+
+        error = float(bar_cy - fish_cy)
+        velocity = float(self._bar_velocity)
+
+        fish_delta = 0.0
+        if self._pd_prev_fish_cy is not None:
+            fish_delta = float(fish_cy - self._pd_prev_fish_cy)
+        self._pd_prev_fish_cy = fish_cy
+
+        dist_ratio = float(error / bar_h)
+        fish_in_bar = float((fish_cy - bar_top) / bar_h)
+
+        if self._prev_mouse_pressed >= 0.5:
+            self._press_streak = max(1, self._press_streak + 1)
+        else:
+            self._press_streak = min(-1, self._press_streak - 1)
+        press_streak = float(self._press_streak / 10.0)
+
+        predicted = float(error + velocity * 0.15)
+        bar_accel = float(velocity - self._pd_prev_velocity)
+        self._pd_prev_velocity = velocity
+
+        return {
+            "fish_cy": fish_cy,
+            "bar_cy": bar_cy,
+            "bar_h": bar_h,
+            "error": error,
+            "velocity": velocity,
+            "fish_delta": fish_delta,
+            "dist_ratio": dist_ratio,
+            "mouse_prev": float(self._prev_mouse_pressed),
+            "fish_in_bar": fish_in_bar,
+            "press_streak": press_streak,
+            "predicted": predicted,
+            "bar_accel": bar_accel,
+        }
+        
+    def _pd_record_frame(self, frame_idx, fish, bar, pd_press, pd_hold, green):
+        if fish is None or bar is None or self._pd_writer is None:
+            return
+
+        feats = self._pd_build_features(fish, bar)
+
+        self._pd_writer.writerow([
+            frame_idx, f"{time.time():.4f}",
+            feats["fish_cy"], feats["bar_cy"], feats["bar_h"],
+            f'{feats["error"]:.1f}', f'{feats["velocity"]:.1f}',
+            f'{feats["fish_delta"]:.1f}', f'{feats["dist_ratio"]:.3f}',
+            f'{feats["mouse_prev"]:.1f}',
+            f'{feats["fish_in_bar"]:.3f}', f'{feats["press_streak"]:.2f}',
+            f'{feats["predicted"]:.1f}', f'{feats["bar_accel"]:.1f}',
+            int(pd_press), f"{pd_hold:.4f}",
+            f"{green:.4f}",
+        ])
+
     def _il_stop_recording(self):
         """结束录制"""
         if self._il_file:
@@ -2034,7 +2167,7 @@ class FishingBot:
         else:
             self.input.mouse_up()
             self._prev_mouse_pressed = 0.0
-            self._last_hold = hold
+            self._last_hold = 0.0
             self._last_fish_cy = fish_cy
             return False
 
@@ -2069,10 +2202,8 @@ class FishingBot:
 
         返回: 是否执行了按住操作
         """
-        now = time.time()
 
         # ═══════════ ★ 速度估算: 只要检测到白条就更新 ═══════════
-        self._update_bar_velocity(bar)
 
         vel = self._bar_velocity
 
@@ -2111,13 +2242,15 @@ class FishingBot:
             hold = max(MIN_HOLD, min(hold, MAX_HOLD))
 
             # 记录上次状态供后备使用
-            self._last_hold = 0.0
+            self._last_hold = hold
             self._last_fish_cy = fish_cy
 
             fname = (self._current_fish_name.replace("fish_", "")
                      if self._current_fish_name else "?")
 
             if hold >= MIN_HOLD + 0.001:
+                self._pd_last_press = True
+                self._pd_last_hold_decision = hold
                 self.input.mouse_down()
                 time.sleep(hold)
                 self.input.mouse_up()
@@ -2127,6 +2260,8 @@ class FishingBot:
                 )
                 return True
             else:
+                self._pd_last_press = False
+                self._pd_last_hold_decision = 0.0
                 self.input.mouse_up()
                 log.info(
                     f"  ○ [{fname}] fib={fish_in_bar:.2f} "
@@ -2155,6 +2290,8 @@ class FishingBot:
                 mid_y = fish_cy
             if fish_cy < mid_y:
                 h = min(fallback * 1.5, MAX_HOLD)
+                self._pd_last_press = True
+                self._pd_last_hold_decision = h
                 self.input.mouse_down()
                 time.sleep(h)
                 self.input.mouse_up()
@@ -2164,6 +2301,8 @@ class FishingBot:
                 )
                 return True
             else:
+                self._pd_last_press = False
+                self._pd_last_hold_decision = 0.0
                 self.input.mouse_up()
                 return False
 
@@ -2185,8 +2324,12 @@ class FishingBot:
                 f"  (仅条) Y={bar_cy} v={vel:+.0f}"
                 f" → 按 {hold*1000:.0f}ms"
             )
+            self._pd_last_press = True
+            self._pd_last_hold_decision = hold
             return True
 
+        self._pd_last_press = False
+        self._pd_last_hold_decision = 0.0
         return False
 
     # ══════════════════════════════════════════════════════

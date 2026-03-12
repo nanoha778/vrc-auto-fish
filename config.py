@@ -152,11 +152,14 @@ IL_STRONG_PRESS = 0.68        # model がこれ以上なら押し寄りで上書
 IL_STRONG_RELEASE = 0.32      # model がこれ以下なら離し寄りで上書き
 
 # Adaptive PD / RL
-USE_ADAPTIVE_PD = True
+USE_ADAPTIVE_PD = False
 ADAPTIVE_PD_MODEL_PATH = "adaptive_pd_rl.zip"   # PPO.save("adaptive_pd_rl") の出力
 ADAPTIVE_PD_HISTORY_LEN = 10
 ADAPTIVE_PD_BASE_KP = 0.040
 ADAPTIVE_PD_BASE_KD = 0.00025
+
+PD_RECORD = True
+PD_DATA_DIR = os.path.join(BASE_DIR, "data", "pd_sessions")
 
 # ═══════════════════════════════════════════════════════════
 #  模板文件映射
