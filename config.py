@@ -150,8 +150,13 @@ IL_USE_HYBRID = False          # imitation を PD の補助として使う
 IL_ASSIST_BAND = 0.25         # dist_ratio のこの範囲だけ model 補助
 IL_STRONG_PRESS = 0.68        # model がこれ以上なら押し寄りで上書き
 IL_STRONG_RELEASE = 0.32      # model がこれ以下なら離し寄りで上書き
-ADAPTIVE_PD_MODEL_PATH = os.path.join(BASE_DIR, "imitation", "adaptive_pd.pt")
-ADAPTIVE_PD_HISTORY_LEN = 30
+
+# Adaptive PD / RL
+USE_ADAPTIVE_PD = True
+ADAPTIVE_PD_MODEL_PATH = "adaptive_pd_rl.zip"   # PPO.save("adaptive_pd_rl") の出力
+ADAPTIVE_PD_HISTORY_LEN = 10
+ADAPTIVE_PD_BASE_KP = 0.040
+ADAPTIVE_PD_BASE_KD = 0.00025
 
 # ═══════════════════════════════════════════════════════════
 #  模板文件映射

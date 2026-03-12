@@ -62,7 +62,16 @@ class FishingBot:
         self.screen   = ScreenCapture()
         self.detector = ImageDetector(config.IMG_DIR, config.TEMPLATE_FILES)
         self.input    = InputController(self.window)
-        self.adaptive_pd = AdaptivePDController()
+        self.adaptive_pd = AdaptivePDController(
+            history_len=getattr(config, "ADAPTIVE_PD_HISTORY_LEN", 10),
+            base_kp=getattr(config, "ADAPTIVE_PD_BASE_KP", config.HOLD_GAIN),
+            base_kd=getattr(config, "ADAPTIVE_PD_BASE_KD", config.SPEED_DAMPING),
+            min_hold=config.HOLD_MIN_S,
+            max_hold=config.HOLD_MAX_S,
+        )
+
+        if getattr(config, "USE_ADAPTIVE_PD", False):
+            self._load_adaptive_pd_policy()
 
         self.yolo = None
         if config.USE_YOLO:
@@ -133,10 +142,32 @@ class FishingBot:
         )
         self._press_streak = 0
         self._prev_mouse_pressed = 0.0
+        self._adaptive_prev_velocity = 0.0
+
+        if getattr(config, "USE_ADAPTIVE_PD", False):
+            self._load_adaptive_pd_policy()
 
     # ══════════════════════════════════════════════════════
     #  截取游戏画面
     # ══════════════════════════════════════════════════════
+
+    def _load_adaptive_pd_policy(self):
+        model_path = getattr(config, "ADAPTIVE_PD_MODEL_PATH", None)
+        if not model_path:
+            log.warning("[AdaptivePD] モデルパス未設定")
+            return
+
+        if not os.path.exists(model_path):
+            log.warning(f"[AdaptivePD] モデルが見つかりません: {model_path}")
+            return
+
+        try:
+            from stable_baselines3 import PPO
+            policy = PPO.load(model_path)
+            self.adaptive_pd.set_policy(policy)
+            log.info(f"[AdaptivePD] PPOモデルを読み込みました: {model_path}")
+        except Exception as e:
+            log.warning(f"[AdaptivePD] モデル読み込み失敗: {e}")
 
     def _grab(self):
         """截取 VRChat 窗口客户区，保证返回非空 BGR 图像"""
@@ -491,6 +522,8 @@ class FishingBot:
         self.hybrid_policy.reset()
         self._press_streak = 0
         self._prev_mouse_pressed = 0.0
+        self.adaptive_pd.reset()
+        self._adaptive_prev_velocity = 0.0
         
 
         if config.IL_RECORD:
@@ -1173,6 +1206,8 @@ class FishingBot:
                 elif config.IL_RECORD:
                     self._il_record_frame(frame, fish, bar)
                     held = False
+                elif getattr(config, "USE_ADAPTIVE_PD", False):
+                    held = self._adaptive_pd_control(fish, bar)
                 elif config.IL_USE_HYBRID and self._il_policy is not None:
                     held = self._hybrid_model_control(fish, bar, search_region)
                 elif config.IL_USE_MODEL and self._il_policy is not None:
@@ -1842,18 +1877,6 @@ class FishingBot:
             predicted=float(predicted),
             bar_accel=float(bar_accel),
         )
-        self.adaptive_pd.update_features(
-            error=float(error),
-            velocity=float(velocity),
-            bar_h=float(bar_h),
-            fish_delta=float(fish_delta),
-            dist_ratio=float(dist_ratio),
-            mouse_prev=float(self._prev_mouse_pressed),
-            fish_in_bar=float(fish_in_bar),
-            press_streak=float(press_streak),
-            predicted=float(predicted),
-            bar_accel=float(bar_accel),
-        )
 
         # --------------------------------------------------
         # 既存PDの判定を「短い hold / release」に変換
@@ -1944,6 +1967,78 @@ class FishingBot:
             self._il_log_counter += 1
             return False
 
+    def _update_adaptive_pd_features(self, fish, bar):
+        if fish is None or bar is None:
+            return
+
+        fish_cy = fish[1] + fish[3] // 2
+        bar_cy = bar[1] + bar[3] // 2
+        bar_h = max(bar[3], 1)
+        bar_top = bar[1]
+
+        error = float(bar_cy - fish_cy)
+        velocity = float(self._bar_velocity)
+
+        fish_delta = 0.0
+        if self._last_fish_cy is not None:
+            fish_delta = float(fish_cy - self._last_fish_cy)
+
+        dist_ratio = float(error / bar_h)
+        fish_in_bar = float((fish_cy - bar_top) / bar_h)
+
+        if self._prev_mouse_pressed >= 0.5:
+            self._press_streak = max(1, self._press_streak + 1)
+        else:
+            self._press_streak = min(-1, self._press_streak - 1)
+        press_streak = float(self._press_streak / 10.0)
+
+        predicted = float(error + velocity * 0.15)
+        bar_accel = float(velocity - self._adaptive_prev_velocity)
+
+        self.adaptive_pd.update_features(
+            error=error,
+            velocity=velocity,
+            bar_h=float(bar_h),
+            fish_delta=fish_delta,
+            dist_ratio=dist_ratio,
+            mouse_prev=float(self._prev_mouse_pressed),
+            fish_in_bar=fish_in_bar,
+            press_streak=press_streak,
+            predicted=predicted,
+            bar_accel=bar_accel,
+        )
+
+        self._adaptive_prev_velocity = velocity
+    def _adaptive_pd_control(self, fish, bar) -> bool:
+        if fish is None or bar is None:
+            self.input.mouse_up()
+            self._prev_mouse_pressed = 0.0
+            self._press_streak = 0
+            return False
+
+        fish_cy = fish[1] + fish[3] // 2
+
+        self._update_adaptive_pd_features(fish, bar)
+        decision = self.adaptive_pd.decide()
+
+        hold = max(config.HOLD_MIN_S, min(float(decision.hold), config.HOLD_MAX_S))
+        press = bool(decision.press)
+
+        if press:
+            self.input.mouse_down()
+            time.sleep(hold)
+            self.input.mouse_up()
+            self._prev_mouse_pressed = 1.0
+            self._last_hold = hold
+            self._last_fish_cy = fish_cy
+            return True
+        else:
+            self.input.mouse_up()
+            self._prev_mouse_pressed = 0.0
+            self._last_hold = hold
+            self._last_fish_cy = fish_cy
+            return False
+        
     def _control_mouse(self, fish, bar, sr) -> bool:
         """
         PD 物理控制器（星露谷钓鱼）:
