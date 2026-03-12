@@ -18,6 +18,8 @@ from core.screen import ScreenCapture
 from core.detector import ImageDetector
 from core.input_ctrl import InputController
 from utils.logger import log
+from imitation.hybrid_policy import HybridPolicyController
+from imitation.adaptive_pd import AdaptivePDController
 
 import ctypes
 import csv
@@ -60,6 +62,7 @@ class FishingBot:
         self.screen   = ScreenCapture()
         self.detector = ImageDetector(config.IMG_DIR, config.TEMPLATE_FILES)
         self.input    = InputController(self.window)
+        self.adaptive_pd = AdaptivePDController()
 
         self.yolo = None
         if config.USE_YOLO:
@@ -120,6 +123,16 @@ class FishingBot:
         self._il_norm_std = None     # 特征归一化标准差
         if config.IL_USE_MODEL:
             self._load_il_policy()
+
+        self.hybrid_policy = HybridPolicyController(
+            model_path=config.IL_MODEL_PATH,
+            history_len=config.IL_HISTORY_LEN,
+            assist_band=config.IL_ASSIST_BAND,
+            strong_press=config.IL_STRONG_PRESS,
+            strong_release=config.IL_STRONG_RELEASE,
+        )
+        self._press_streak = 0
+        self._prev_mouse_pressed = 0.0
 
     # ══════════════════════════════════════════════════════
     #  截取游戏画面
@@ -463,6 +476,8 @@ class FishingBot:
     # ══════════════════════════════════════════════════════
 
     def _fishing_minigame(self) -> bool:
+
+
         self.state = "小游戏进行中"
         log.info("[🐟 钓鱼] 小游戏开始")
 
@@ -473,6 +488,10 @@ class FishingBot:
         self._il_press_streak = 0
         self._il_prev_velocity = 0.0
         self._il_log_counter = 0
+        self.hybrid_policy.reset()
+        self._press_streak = 0
+        self._prev_mouse_pressed = 0.0
+        
 
         if config.IL_RECORD:
             self._il_start_recording()
@@ -518,6 +537,13 @@ class FishingBot:
         obj_gone_count = 0             # ★ 连续对象不足帧数
         fish_gone_since = None         # ★ 鱼消失开始时间
         bar_gone_since  = None         # ★ 白条消失开始时间
+
+        # ── 瞬时丢失保护: fish / bar 保持最近5帧 ──
+        _HOLD_FRAMES = 2
+        _last_fish_box = None
+        _last_bar_box = None
+        _fish_hold_left = 0
+        _bar_hold_left = 0
 
         # ── 重置 PD 控制器 ──
         self._bar_prev_cy   = None
@@ -820,6 +846,35 @@ class FishingBot:
 
                     fish, _matched_key = fish_result
                     bar, _bar_scale = bar_result
+                # ════════════ ★ 瞬时丢失保护 (保持最近5帧) ════════════
+                # 目标:
+                # - YOLO / 模板匹配偶发1~5帧漏检时，不立刻把 fish/bar 视为丢失
+                # - 用最近一次有效框暂时顶上，减少“看丢一下就整局崩”的情况
+
+                if fish is not None:
+                    _last_fish_box = fish
+                    _fish_hold_left = _HOLD_FRAMES
+                elif _last_fish_box is not None and _fish_hold_left > 0:
+                    fish = _last_fish_box
+                    _fish_hold_left -= 1
+                    if _fish_hold_left == _HOLD_FRAMES - 1:
+                        log.debug(f"[HOLD] fish 漏检，复用最近框 { _HOLD_FRAMES } 帧")
+                else:
+                    _last_fish_box = None
+                    _fish_hold_left = 0
+
+                if bar is not None:
+                    _last_bar_box = bar
+                    _bar_hold_left = _HOLD_FRAMES
+                elif _last_bar_box is not None and _bar_hold_left > 0:
+                    bar = _last_bar_box
+                    _bar_hold_left -= 1
+                    if _bar_hold_left == _HOLD_FRAMES - 1:
+                        log.debug(f"[HOLD] bar 漏检，复用最近框 { _HOLD_FRAMES } 帧")
+                else:
+                    _last_bar_box = None
+                    _bar_hold_left = 0
+
                 if not _use_yolo:
                     fish_detect_name = ""
                     if locked_fish_key:
@@ -1118,12 +1173,12 @@ class FishingBot:
                 elif config.IL_RECORD:
                     self._il_record_frame(frame, fish, bar)
                     held = False
+                elif config.IL_USE_HYBRID and self._il_policy is not None:
+                    held = self._hybrid_model_control(fish, bar, search_region)
                 elif config.IL_USE_MODEL and self._il_policy is not None:
                     held = self._il_model_control(fish, bar)
                 else:
                     held = self._control_mouse(fish, bar, search_region)
-                if held:
-                    hold_count += 1
 
                 # 5秒后切回用户设置的调试模式
                 if frame == 50:
@@ -1170,9 +1225,9 @@ class FishingBot:
                 self.input.safe_release()
                 # 安全间隔: 防止 PD 控制器最后一次 mouse_down 在游戏结束
                 # 瞬间变成意外点击（导致误下饵）
-                time.sleep(0.5)
+                time.sleep(0.3)
                 if success:
-                    time.sleep(0.2)
+                    time.sleep(0.5)
                     self.input.click()
                     log.info("[🎣 收杆] 钓鱼成功, 点击收杆")
                 else:
@@ -1721,6 +1776,163 @@ class FishingBot:
                 log.info(
                     f"  [IL] 鱼Y={fish_cy} 条Y={bar_cy} "
                     f"p={prob:.2f}<={thresh:.2f} → 释放"
+                )
+            self._il_log_counter += 1
+            return False
+
+
+    def _hybrid_model_control(self, fish, bar, sr) -> bool:
+        """
+        PD制御をベースにしつつ、迷う場面だけ imitation で補助する。
+        戻り値: 最終的に「押した」なら True
+        """
+        # policy が無いなら普通に PD へ
+        if self._il_policy is None or not config.IL_USE_HYBRID:
+            return self._control_mouse(fish, bar, sr)
+
+        # fish/bar 両方見えてない時は PD に任せる
+        if fish is None or bar is None:
+            return self._control_mouse(fish, bar, sr)
+
+        # --------------------------------------------------
+        # まず既存PDと同じ材料を計算
+        # --------------------------------------------------
+        fish_cy = fish[1] + fish[3] // 2
+        bar_cy  = bar[1] + bar[3] // 2
+        bar_h   = max(bar[3], 1)
+        bar_top = bar[1]
+
+        error = bar_cy - fish_cy
+        velocity = self._bar_velocity
+
+        fish_delta = 0.0
+        if self._il_prev_fish_cy is not None:
+            fish_delta = fish_cy - self._il_prev_fish_cy
+        self._il_prev_fish_cy = fish_cy
+
+        dist_ratio = error / max(bar_h, 1)
+        fish_in_bar = (fish_cy - bar_top) / max(bar_h, 1)
+
+        # press streak
+        if self._prev_mouse_pressed >= 0.5:
+            self._press_streak = max(1, self._press_streak + 1)
+        else:
+            self._press_streak = min(-1, self._press_streak - 1)
+        press_streak = self._press_streak / 10.0
+
+        predicted = error + velocity * 0.15
+
+        bar_accel = 0.0
+        if hasattr(self, '_il_prev_velocity'):
+            bar_accel = velocity - self._il_prev_velocity
+        self._il_prev_velocity = velocity
+
+        # --------------------------------------------------
+        # imitation 側に特徴を投入
+        # --------------------------------------------------
+        self.hybrid_policy.update_features(
+            error=float(error),
+            velocity=float(velocity),
+            bar_h=float(bar_h),
+            fish_delta=float(fish_delta),
+            dist_ratio=float(dist_ratio),
+            mouse_prev=float(self._prev_mouse_pressed),
+            fish_in_bar=float(fish_in_bar),
+            press_streak=float(press_streak),
+            predicted=float(predicted),
+            bar_accel=float(bar_accel),
+        )
+        self.adaptive_pd.update_features(
+            error=float(error),
+            velocity=float(velocity),
+            bar_h=float(bar_h),
+            fish_delta=float(fish_delta),
+            dist_ratio=float(dist_ratio),
+            mouse_prev=float(self._prev_mouse_pressed),
+            fish_in_bar=float(fish_in_bar),
+            press_streak=float(press_streak),
+            predicted=float(predicted),
+            bar_accel=float(bar_accel),
+        )
+
+        # --------------------------------------------------
+        # 既存PDの判定を「短い hold / release」に変換
+        # ここでは _control_mouse を丸ごと呼ばず、
+        # 同じ計算式で最終 press/release だけ決める
+        # --------------------------------------------------
+        TARGET_FIB = 0.5
+        KP         = getattr(config, 'HOLD_GAIN', 0.040)
+        KD         = getattr(config, 'SPEED_DAMPING', 0.00025)
+        BASE_HOLD  = getattr(config, 'HOLD_MIN_S', 0.025)
+        MAX_HOLD   = getattr(config, 'HOLD_MAX_S', 0.100)
+        MIN_HOLD   = 0.004
+
+        error_fib = TARGET_FIB - fish_in_bar
+        error_clamp = max(-2.0, min(2.0, error_fib))
+        decision = self.adaptive_pd.decide(
+            error=float(error_clamp),
+            velocity=float(velocity),
+            base_hold=float(BASE_HOLD),
+            min_hold=float(MIN_HOLD),
+            max_hold=float(MAX_HOLD),
+            hold_gain=float(KP),
+            speed_damping=float(KD),
+        )
+        if self._il_log_counter % 20 == 0:
+            log.info(
+                f"[APD] mode={decision.mode} "
+                f"kp={decision.kp:.5f} kd={decision.kd:.6f} "
+                f"dkp={decision.delta_kp:+.5f} dkd={decision.delta_kd:+.6f} "
+                f"hold={decision.hold:.4f}"
+            )
+
+        hold = decision.hold
+        pd_press = decision.press
+
+        # --------------------------------------------------
+        # hybrid 判定
+        # --------------------------------------------------
+        hybrid = self.hybrid_policy.decide(
+            pd_press=bool(pd_press),
+            dist_ratio=float(dist_ratio),
+            error_px=float(error),
+        )
+
+        final_press = hybrid.press
+
+        # --------------------------------------------------
+        # 最終入力
+        # --------------------------------------------------
+        fname = (self._current_fish_name.replace("fish_", "")
+                if self._current_fish_name else "?")
+
+        if final_press:
+            self.input.mouse_down()
+            time.sleep(hold)
+            self.input.mouse_up()
+            self._prev_mouse_pressed = 1.0
+            self._last_hold = hold
+            self._last_fish_cy = fish_cy
+
+            if self._il_log_counter % 10 == 0:
+                log.info(
+                    f"  [HYB] [{fname}] fib={fish_in_bar:.2f} "
+                    f"v={velocity:+.0f} p={hybrid.probability:.2f} "
+                    f"mode={hybrid.mode} -> 按 {hold*1000:.0f}ms"
+                )
+            self._il_log_counter += 1
+            return True
+        else:
+            self.input.mouse_up()
+            self._prev_mouse_pressed = 0.0
+            self._last_hold = hold
+            self._last_fish_cy = fish_cy
+
+            if self._il_log_counter % 10 == 0:
+                log.info(
+                    f"  [HYB] [{fname}] fib={fish_in_bar:.2f} "
+                    f"v={velocity:+.0f} p={hybrid.probability:.2f} "
+                    f"mode={hybrid.mode} -> 释放"
                 )
             self._il_log_counter += 1
             return False

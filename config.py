@@ -34,16 +34,16 @@ HOTKEY_DEBUG  = "F11"
 # ═══════════════════════════════════════════════════════════
 #  时间参数（秒）
 # ═══════════════════════════════════════════════════════════
-CAST_DELAY          = 1.5         # 抛竿后等待
+CAST_DELAY          = 1.0         # 抛竿后等待
 BITE_TIMEOUT        = 60.0        # 最长等鱼时间 (绝对上限)
 BITE_FORCE_HOOK     = 0.500       # N秒无咬钩 → 强制提竿进入小游戏 (防漏检)
 BITE_CHECK_INTERVAL = 0.15        # 咬钩检测间隔
-MIN_BITE_WAIT       = 3.0         # 最少等待N秒才开始检测咬钩（防止误检）
+MIN_BITE_WAIT       = 1.0         # 最少等待N秒才开始检测咬钩（防止误检）
 COLOR_BITE_WAIT     = 6.0         # N秒后才启用颜色检测（模板优先）
 COLOR_BITE_PIXELS   = 500         # 颜色检测最少像素数（越高越严格）
 HOOK_PRE_DELAY      = 0.1         # 提竿前延迟 (★ 0.2→0.1)
 HOOK_POST_DELAY     = 0.4         # 提竿后等待 UI 出现 (★ 0.3→0.4)
-VERIFY_TIMEOUT      = 3.0         # 提竿后验证小游戏出现的超时(秒)
+VERIFY_TIMEOUT      = 1.0         # 提竿后验证小游戏出现的超时(秒)
 VERIFY_CONSECUTIVE  = 1           # ★ 累计N帧检测到白条+轨道即确认
 GAME_LOOP_INTERVAL  = 0.005       # 小游戏循环间隔 (60FPS游戏, 尽量快)
 SHOW_DEBUG             = True     # 是否显示debug窗口 (关闭可提升性能)
@@ -60,7 +60,7 @@ SHAKE_HEAD_TIME     = 0.0300      # 摇头每段按住时长(秒)
 INITIAL_PRESS_TIME  = 0.2         # 开局按压时长(秒)
 SUCCESS_PROGRESS    = 0.42        # 进度条 > 此值判定钓鱼成功 (0~1)
 MINIGAME_TIMEOUT    = 120.0       # 小游戏最长持续时间 (秒), 超过强制结束
-UI_CHECK_FRAMES     = 30           # 每N帧检查一次轨道是否还在 (15→30, 降低检查频率)
+UI_CHECK_FRAMES     = 15           # 每N帧检查一次轨道是否还在 (15→30, 降低检查频率)
 UI_GONE_LIMIT       = 4            # 连续N次轨道检查失败 → 判定游戏结束 (2→4)
 
 # ═══════════════════════════════════════════════════════════
@@ -91,13 +91,13 @@ FISH_GAME_SIZE = 30
 # ═══════════════════════════════════════════════════════════
 # ── PD 控制器参数 (适配高惯性钓鱼) ──
 DEAD_ZONE       = 12              # 固定死区(px), 备用 (动态死区优先)
-DEAD_ZONE_RATIO = 0.35            # 动态死区: 白条高度 × 此比例 (鱼在白条中心此范围内=居中)
-MAINTAIN_TAP_S  = 0.010           # 死区内维持性短按时长(秒), 抵消重力防坠底
+DEAD_ZONE_RATIO = 0.22            # 动态死区: 白条高度 × 此比例 (鱼在白条中心此范围内=居中)
+MAINTAIN_TAP_S  = 0.006           # 死区内维持性短按时长(秒), 抵消重力防坠底
 HOLD_MIN_S      = 0.015           # 抗重力基准 (秒) — 越小下降越快
-HOLD_MAX_S      = 0.100           # 单次最长按住 (秒)
-HOLD_GAIN       = 0.040           # 位置增益: 误差×增益=额外按住时长
-VELOCITY_SMOOTH = 0.5             # 速度低通滤波系数 (0~1, 越大越平滑)
-PREDICT_AHEAD   = 0.400           # 前瞻时间 (秒) — 高惯性系统需要更远的预判
+HOLD_MAX_S      = 0.120           # 单次最长按住 (秒)
+HOLD_GAIN       = 0.055           # 位置增益: 误差×增益=额外按住时长
+VELOCITY_SMOOTH = 0.3             # 速度低通滤波系数 (0~1, 越大越平滑)
+PREDICT_AHEAD   = 0.22            # 前瞻时间 (秒) — 高惯性系统需要更远的预判
 SPEED_DAMPING   = 0.00025         # 速度阻尼: 下坠快时加按住, 上升快时减按住
 MAX_FISH_BAR_DIST = 300           # ★ 鱼和白条中心最大合理距离(px), 超过视为误检
 REGION_UP         = 300           # 白条锁定后, 向上搜索像素数
@@ -121,16 +121,16 @@ FORCE_RESET_DELAY = 15.0             # 强制重置等待时间(秒), 等待游�
 # ═══════════════════════════════════════════════════════════
 #  界面语言设置 (zh/en/jp)
 # ═══════════════════════════════════════════════════════════
-LANGUAGE = "zh"                      # 界面语言: zh=中文, en=English, jp=日本語
+LANGUAGE = "jp"                      # 界面语言: zh=中文, en=English, jp=日本語
 
 # ═══════════════════════════════════════════════════════════
 #  YOLO 目标检测 (替代模板匹配, 需训练后使用)
 # ═══════════════════════════════════════════════════════════
 USE_YOLO      = True
 YOLO_MODEL    = os.path.join(BASE_DIR, "yolo", "runs", "fish_detect", "weights", "best.pt")
-YOLO_CONF     = 0.45              # YOLO 检测置信度阈值
+YOLO_CONF     = 0.35              # YOLO 检测置信度阈值
 YOLO_DEVICE   = "auto"            # "auto" 优先GPU / "cpu" 强制CPU / "gpu" 强制GPU
-YOLO_COLLECT  = False             # True=钓鱼时自动保存截图用于训练
+YOLO_COLLECT  = True             # True=钓鱼时自动保存截图用于训练
 YOLO_COLLECT_ON_FAIL = False      # True=仅在钓鱼失败时采集图像（独立开关，无需开启YOLO_COLLECT）
 TRACK_MIN_ANGLE   = 3.0           # 轨道倾斜角度阈值(度), 超过此值启用旋转补偿
 TRACK_MAX_ANGLE   = 45.0          # 轨道最大合理角度(度), 超过视为误检(如把海平线当轨道)
@@ -144,6 +144,14 @@ IL_MODEL_PATH   = os.path.join(BASE_DIR, "imitation", "policy.pt")
 IL_DATA_DIR     = os.path.join(BASE_DIR, "imitation", "data")
 IL_HISTORY_LEN  = 10              # 输入历史帧数 (捕捉鱼的运动模式)
 IL_PRESS_THRESH = 0.50            # 按住阈值: 模型概率 > 此值才按住 (默认0.5, 按太久就调高)
+
+# ── Hybrid imitation assist ──
+IL_USE_HYBRID = True          # imitation を PD の補助として使う
+IL_ASSIST_BAND = 0.25         # dist_ratio のこの範囲だけ model 補助
+IL_STRONG_PRESS = 0.68        # model がこれ以上なら押し寄りで上書き
+IL_STRONG_RELEASE = 0.32      # model がこれ以下なら離し寄りで上書き
+ADAPTIVE_PD_MODEL_PATH = os.path.join(BASE_DIR, "imitation", "adaptive_pd.pt")
+ADAPTIVE_PD_HISTORY_LEN = 10
 
 # ═══════════════════════════════════════════════════════════
 #  模板文件映射
