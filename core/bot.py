@@ -144,9 +144,6 @@ class FishingBot:
         self._prev_mouse_pressed = 0.0
         self._adaptive_prev_velocity = 0.0
 
-        if getattr(config, "USE_ADAPTIVE_PD", False):
-            self._load_adaptive_pd_policy()
-
     # ══════════════════════════════════════════════════════
     #  截取游戏画面
     # ══════════════════════════════════════════════════════
@@ -1200,6 +1197,8 @@ class FishingBot:
                     obj_gone_count = 0
 
                 # ════════════ ★ 控制 (录制 / 模型 / PD) ════════════
+                self._update_bar_velocity(bar)
+
                 if _skip_fish:
                     self.input.mouse_up()
                     held = False
@@ -2038,6 +2037,20 @@ class FishingBot:
             self._last_hold = hold
             self._last_fish_cy = fish_cy
             return False
+
+    def _update_bar_velocity(self, bar):
+        """白条速度推定。bar が見えているフレームでは毎回更新する。"""
+        now = time.time()
+        if bar is not None:
+            bar_cy_raw = bar[1] + bar[3] // 2
+            if self._bar_prev_cy is not None and self._bar_prev_time is not None:
+                dt = now - self._bar_prev_time
+                if dt > 0.003:
+                    raw_vel = (bar_cy_raw - self._bar_prev_cy) / dt
+                    a = min(config.VELOCITY_SMOOTH, 0.95)
+                    self._bar_velocity = a * self._bar_velocity + (1 - a) * raw_vel
+            self._bar_prev_cy = bar_cy_raw
+            self._bar_prev_time = now
         
     def _control_mouse(self, fish, bar, sr) -> bool:
         """
@@ -2059,19 +2072,7 @@ class FishingBot:
         now = time.time()
 
         # ═══════════ ★ 速度估算: 只要检测到白条就更新 ═══════════
-        if bar is not None:
-            bar_cy_raw = bar[1] + bar[3] // 2
-            if (self._bar_prev_cy is not None
-                    and self._bar_prev_time is not None):
-                dt = now - self._bar_prev_time
-                if dt > 0.003:
-                    raw_vel = (bar_cy_raw - self._bar_prev_cy) / dt
-                    α = min(config.VELOCITY_SMOOTH, 0.95)
-                    self._bar_velocity = (
-                        α * self._bar_velocity + (1 - α) * raw_vel
-                    )
-            self._bar_prev_cy = bar_cy_raw
-            self._bar_prev_time = now
+        self._update_bar_velocity(bar)
 
         vel = self._bar_velocity
 
@@ -2110,7 +2111,7 @@ class FishingBot:
             hold = max(MIN_HOLD, min(hold, MAX_HOLD))
 
             # 记录上次状态供后备使用
-            self._last_hold = hold
+            self._last_hold = 0.0
             self._last_fish_cy = fish_cy
 
             fname = (self._current_fish_name.replace("fish_", "")
