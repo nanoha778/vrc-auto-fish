@@ -60,8 +60,10 @@ SHAKE_HEAD_TIME     = 0.0300      # 摇头每段按住时长(秒)
 INITIAL_PRESS_TIME  = 0.2         # 开局按压时长(秒)
 SUCCESS_PROGRESS    = 0.42        # 进度条 > 此值判定钓鱼成功 (0~1)
 MINIGAME_TIMEOUT    = 120.0       # 小游戏最长持续时间 (秒), 超过强制结束
-UI_CHECK_FRAMES     = 15           # 每N帧检查一次轨道是否还在 (15→30, 降低检查频率)
-UI_GONE_LIMIT       = 4            # 连续N次轨道检查失败 → 判定游戏结束 (2→4)
+UI_CHECK_FRAMES     = 5           # 每N帧检查一次轨道是否还在 (15→30, 降低检查频率)
+UI_GONE_LIMIT       = 2            # 连续N次轨道检查失败 → 判定游戏结束 (2→4)
+SUCCESS_CLICK_DELAY = 0.5
+POST_RELEASE_DELAY = 0
 
 # ═══════════════════════════════════════════════════════════
 #  模板匹配置信度阈值
@@ -114,7 +116,7 @@ PAUSE_ON_MOUSE_ZERO = False          # True=检测到鼠标在(0,0)坐标时自�
 # ═══════════════════════════════════════════════════════════
 #  强制重置功能 (连续未检测到小游戏)
 # ═══════════════════════════════════════════════════════════
-ENABLE_FORCE_RESET = True            # True=启用强制重置功能
+ENABLE_FORCE_RESET = False            # True=启用强制重置功能
 MAX_RETRY_NO_MINIGAME = 3            # 连续N次未检测到小游戏则强制重置
 FORCE_RESET_DELAY = 15.0             # 强制重置等待时间(秒), 等待游戏自动重置
 
@@ -128,7 +130,7 @@ LANGUAGE = "jp"                      # 界面语言: zh=中文, en=English, jp=�
 # ═══════════════════════════════════════════════════════════
 USE_YOLO      = True
 YOLO_MODEL    = os.path.join(BASE_DIR, "yolo", "runs", "fish_detect", "weights", "best.pt")
-YOLO_CONF     = 0.35              # YOLO 检测置信度阈值
+YOLO_CONF     = 0.25              # YOLO 检测置信度阈值
 YOLO_DEVICE   = "auto"            # "auto" 优先GPU / "cpu" 强制CPU / "gpu" 强制GPU
 YOLO_COLLECT  = True             # True=钓鱼时自动保存截图用于训练
 YOLO_COLLECT_ON_FAIL = False      # True=仅在钓鱼失败时采集图像（独立开关，无需开启YOLO_COLLECT）
@@ -158,7 +160,7 @@ ADAPTIVE_PD_HISTORY_LEN = 10
 ADAPTIVE_PD_BASE_KP = 0.040
 ADAPTIVE_PD_BASE_KD = 0.00025
 
-PD_RECORD = True
+PD_RECORD = False
 PD_DATA_DIR = os.path.join(BASE_DIR, "data", "pd_sessions")
 
 # ═══════════════════════════════════════════════════════════
