@@ -1214,7 +1214,7 @@ class FishingApp:
     # ══════════════════════════════════════════════════════
 
     def _poll(self):
-                # 学習スレッドのログを回収
+        # 学習スレッドのログを回収
         try:
             while True:
                 item = self._train_queue.get_nowait()

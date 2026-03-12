@@ -146,7 +146,7 @@ IL_HISTORY_LEN  = 10              # 输入历史帧数 (捕捉鱼的运动模式
 IL_PRESS_THRESH = 0.50            # 按住阈值: 模型概率 > 此值才按住 (默认0.5, 按太久就调高)
 
 # ── Hybrid imitation assist ──
-IL_USE_HYBRID = True          # imitation を PD の補助として使う
+IL_USE_HYBRID = False          # imitation を PD の補助として使う
 IL_ASSIST_BAND = 0.25         # dist_ratio のこの範囲だけ model 補助
 IL_STRONG_PRESS = 0.68        # model がこれ以上なら押し寄りで上書き
 IL_STRONG_RELEASE = 0.32      # model がこれ以下なら離し寄りで上書き

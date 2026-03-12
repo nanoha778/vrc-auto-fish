@@ -1873,20 +1873,11 @@ class FishingBot:
         error_fib = TARGET_FIB - fish_in_bar
         error_clamp = max(-2.0, min(2.0, error_fib))
 
+        # まずPDだけの hold
         pd_hold = BASE_HOLD + error_clamp * KP + velocity * KD
-        
-        apd = self.adaptive_pd.decide(
-            error=float(error_clamp),
-            velocity=float(velocity),
-            base_hold=float(BASE_HOLD),
-            min_hold=float(MIN_HOLD),
-            max_hold=float(MAX_HOLD),
-            hold_gain=float(KP),
-            speed_damping=float(KD),
-        )
+        pd_hold = max(MIN_HOLD, min(pd_hold, MAX_HOLD))
 
-        pd_hold = apd.hold
-        pd_press = apd.press
+        pd_press = pd_hold >= MIN_HOLD + 0.001
 
         # --------------------------------------------------
         # hybrid 判定
@@ -1897,13 +1888,24 @@ class FishingBot:
             error_px=float(error),
         )
 
+        # --------------------------------------------------
+        # residual hold correction
+        # press/releaseの二値overrideではなく、
+        # モデル確率で hold を微調整する
+        # --------------------------------------------------
         assist_prob = hybrid.probability
+
+        # -0.01 ~ +0.01 秒くらいの微調整から始める
         delta_hold = (assist_prob - 0.5) * 0.02
+
+        # 高速時だけ補正を少し強める
+        speed_factor = min(1.0, abs(velocity) / 250.0)
+        delta_hold *= (0.35 + 0.65 * speed_factor)
 
         hold = pd_hold + delta_hold
         hold = max(MIN_HOLD, min(hold, MAX_HOLD))
-        final_press = hold >= MIN_HOLD + 0.001
 
+        final_press = hold >= MIN_HOLD + 0.001
 
         # --------------------------------------------------
         # 最終入力
