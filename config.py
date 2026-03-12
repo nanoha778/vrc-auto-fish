@@ -151,7 +151,7 @@ IL_ASSIST_BAND = 0.25         # dist_ratio のこの範囲だけ model 補助
 IL_STRONG_PRESS = 0.68        # model がこれ以上なら押し寄りで上書き
 IL_STRONG_RELEASE = 0.32      # model がこれ以下なら離し寄りで上書き
 ADAPTIVE_PD_MODEL_PATH = os.path.join(BASE_DIR, "imitation", "adaptive_pd.pt")
-ADAPTIVE_PD_HISTORY_LEN = 10
+ADAPTIVE_PD_HISTORY_LEN = 30
 
 # ═══════════════════════════════════════════════════════════
 #  模板文件映射

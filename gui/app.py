@@ -898,7 +898,7 @@ class FishingApp:
 
         def worker():
             try:
-                from train_adaptive_pd import run_training
+                from imitation.train_adaptive_pd import run_training
 
                 result = run_training(
                     epochs=epochs,
