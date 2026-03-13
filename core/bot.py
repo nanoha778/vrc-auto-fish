@@ -38,6 +38,7 @@ def _get_yolo_detector(force_reload=False):
     return _yolo_detector
 
 
+
 class FishingBot:
     """VRChat 自动钓鱼机器人"""
 
@@ -82,6 +83,23 @@ class FishingBot:
         self._bar_velocity  = 0.0        # 白条速度估算 (px/s, 正=下, 负=上)
         self._last_hold     = None       # 上一帧 hold 时长 (后备用)
         self._last_fish_cy  = None       # 上一次鱼的中心 Y (后备用)
+
+        # ── PD教師データ収集 ──
+        self._pd_writer = None
+        self._pd_file = None
+        self._pd_episode_id = 0
+        self._pd_frame_idx = 0
+
+        self._pd_prev_fish_cy = None
+        self._pd_prev_bar_cy = None
+        self._pd_prev_bar_v = 0.0
+        self._pd_prev_mouse = 0
+        self._pd_press_streak = 0
+
+        self._pd_last_fish_box = None
+        self._pd_last_bar_box = None
+        self._pd_last_progress = 0.0
+        self._pd_last_end_reason = ""
 
         # ── Debug overlay (独立线程, 不阻塞钓鱼逻辑) ──
         self._last_overlay_time = 0
@@ -241,6 +259,230 @@ class FishingBot:
             screen, M, (new_w, new_h), borderValue=(0, 0, 0)
         )
 
+
+    # ══════════════════════════════════════════════════════
+    # PD教師データ収集
+    # ══════════════════════════════════════════════════════
+    def _pd_start_recording(self):
+        """PD教師データのCSVを開く（セッション単位で1ファイル）"""
+        if self._pd_writer is not None:
+            return
+
+        os.makedirs(config.PD_DATA_DIR, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(config.PD_DATA_DIR, f"pd_session_{ts}.csv")
+
+        self._pd_file = open(path, "w", newline="", encoding="utf-8")
+        self._pd_writer = csv.writer(self._pd_file)
+
+        self._pd_writer.writerow([
+            "episode_id",
+            "frame_idx",
+            "t",
+            "fish_name",
+
+            # 生値
+            "fish_cy",
+            "bar_cy",
+            "bar_h",
+
+            # IL互換 10特徴
+            "error",
+            "velocity",
+            "fish_delta",
+            "dist_ratio",
+            "mouse",
+            "fish_in_bar",
+            "press_streak",
+            "predicted",
+            "bar_accel",
+
+            # 教師
+            "action_press",
+            "control_value",
+            "in_deadzone",
+
+            # 解析用
+            "progress",
+            "end_reason",
+            "episode_done",
+            "episode_success",
+        ])
+        self._pd_file.flush()
+        log.info(f"[PD_RECORD] 記録開始: {path}")
+
+    def _pd_close_recording(self):
+        """必要なら明示的に閉じる"""
+        if self._pd_file is not None:
+            try:
+                self._pd_file.flush()
+                self._pd_file.close()
+            except Exception:
+                pass
+        self._pd_file = None
+        self._pd_writer = None
+
+    def _pd_reset_episode(self):
+        """ミニゲーム1回分の状態をリセット"""
+        self._pd_episode_id += 1
+        self._pd_frame_idx = 0
+        self._pd_prev_fish_cy = None
+        self._pd_prev_bar_cy = None
+        self._pd_prev_bar_v = 0.0
+        self._pd_prev_mouse = 0
+        self._pd_press_streak = 0
+        self._pd_last_fish_box = None
+        self._pd_last_bar_box = None
+        self._pd_last_progress = 0.0
+        self._pd_last_end_reason = ""
+
+    @staticmethod
+    def _pd_clamp(v, lo, hi):
+        return max(lo, min(hi, v))
+
+    @staticmethod
+    def _pd_safe_div(a, b, default=0.0):
+        return a / b if abs(b) > 1e-6 else default
+
+    def _pd_extract_features(self, fish_box, bar_box):
+        """
+        imitation/model.py と揃えた 10特徴を作る
+        """
+        fish_cy = float(fish_box[1] + fish_box[3] / 2.0)
+        bar_cy = float(bar_box[1] + bar_box[3] / 2.0)
+        bar_h = float(bar_box[3])
+
+        error = bar_cy - fish_cy
+
+        if self._pd_prev_bar_cy is None:
+            velocity = 0.0
+        else:
+            velocity = bar_cy - self._pd_prev_bar_cy
+
+        if self._pd_prev_fish_cy is None:
+            fish_delta = 0.0
+        else:
+            fish_delta = fish_cy - self._pd_prev_fish_cy
+
+        dist_ratio = self._pd_safe_div(error, max(bar_h, 1.0), 0.0)
+
+        fish_in_bar = self._pd_safe_div(
+            fish_cy - (bar_cy - bar_h / 2.0),
+            max(bar_h, 1.0),
+            0.5,
+        )
+        fish_in_bar = self._pd_clamp(fish_in_bar, -1.5, 2.5)
+
+        press_streak_norm = self._pd_clamp(self._pd_press_streak / 30.0, -1.0, 1.0)
+        predicted = error + velocity * 0.15
+        bar_accel = velocity - self._pd_prev_bar_v
+
+        return {
+            "fish_cy": fish_cy,
+            "bar_cy": bar_cy,
+            "bar_h": bar_h,
+            "error": float(error),
+            "velocity": float(velocity),
+            "fish_delta": float(fish_delta),
+            "dist_ratio": float(dist_ratio),
+            "mouse": float(self._pd_prev_mouse),
+            "fish_in_bar": float(fish_in_bar),
+            "press_streak": float(press_streak_norm),
+            "predicted": float(predicted),
+            "bar_accel": float(bar_accel),
+        }
+
+    def _pd_record_frame(
+        self,
+        *,
+        fish_box,
+        bar_box,
+        fish_name,
+        action_press,
+        control_value,
+        in_deadzone,
+        progress=0.0,
+        end_reason="",
+        episode_done=0,
+        episode_success=0,
+    ):
+        if not config.PD_RECORD:
+            return
+        if self._pd_writer is None:
+            return
+        if fish_box is None or bar_box is None:
+            return
+
+        feat = self._pd_extract_features(fish_box, bar_box)
+
+        self._pd_writer.writerow([
+            self._pd_episode_id,
+            self._pd_frame_idx,
+            time.time(),
+            fish_name or "",
+
+            feat["fish_cy"],
+            feat["bar_cy"],
+            feat["bar_h"],
+
+            feat["error"],
+            feat["velocity"],
+            feat["fish_delta"],
+            feat["dist_ratio"],
+            feat["mouse"],
+            feat["fish_in_bar"],
+            feat["press_streak"],
+            feat["predicted"],
+            feat["bar_accel"],
+
+            int(action_press),
+            float(control_value),
+            int(bool(in_deadzone)),
+
+            float(progress),
+            end_reason,
+            int(episode_done),
+            int(episode_success),
+        ])
+
+        if self._pd_frame_idx % 100 == 0:
+            self._pd_file.flush()
+
+        # 次フレーム用状態更新
+        if int(action_press) == self._pd_prev_mouse:
+            if int(action_press) == 1:
+                self._pd_press_streak += 1
+            else:
+                self._pd_press_streak -= 1
+        else:
+            self._pd_press_streak = 1 if int(action_press) == 1 else -1
+
+        self._pd_prev_mouse = int(action_press)
+        self._pd_prev_fish_cy = feat["fish_cy"]
+        self._pd_prev_bar_cy = feat["bar_cy"]
+        self._pd_prev_bar_v = feat["velocity"]
+        self._pd_frame_idx += 1
+
+    def _pd_record_episode_end(self, *, fish_box, bar_box, fish_name, progress, success, end_reason):
+        """
+        最後の1行を done=1 として追加。
+        最後の fish/bar が無いなら書かない。
+        """
+        if fish_box is None or bar_box is None:
+            return
+
+        self._pd_record_frame(
+            fish_box=fish_box,
+            bar_box=bar_box,
+            fish_name=fish_name,
+            action_press=self._pd_prev_mouse,
+            control_value=0.0,
+            in_deadzone=False,
+            progress=progress,
+            end_reason=end_reason,
+            episode_done=1,
+            episode_success=1 if success else 0,
+        )
     # ══════════════════════════════════════════════════════
     #  第1步: 抛竿
     # ══════════════════════════════════════════════════════
@@ -547,6 +789,12 @@ class FishingBot:
         self._il_press_streak = 0
         self._il_prev_velocity = 0.0
         self._il_log_counter = 0
+
+        # ── PD教師データ収集: 毎回リセット ──
+        if config.PD_RECORD and (not config.IL_RECORD) and (not config.IL_USE_MODEL):
+            self._pd_start_recording()
+            self._pd_reset_episode()
+            log.info("[PD_RECORD] 今回のミニゲームを教師データとして記録します")
 
         if config.IL_RECORD:
             self._il_start_recording()
@@ -1061,6 +1309,11 @@ class FishingBot:
                     if _yolo_progress is not None and frame % 10 == 1:
                         log.info("  ↺ 進捗バーを直前5フレームの履歴で補完しました")
 
+                if fish is not None:
+                    self._pd_last_fish_box = fish
+                if bar is not None:
+                    self._pd_last_bar_box = bar
+
                 # ════════════ デバッグ描画 ════════════
                 if not self._need_rotation:
                     self._show_debug_overlay(
@@ -1148,6 +1401,9 @@ class FishingBot:
                     _prev_green = green
                 if green > _last_green:
                     _last_green = green
+
+                self._pd_last_progress = _last_green
+
                 # ════════════ ミニゲーム終了判定 ════════════
                 obj_count = ((fish is not None) + (bar is not None) + (1 if track_alive else 0))
 
@@ -1303,6 +1559,19 @@ class FishingBot:
                     f"[❌ 失敗] 最終進捗 {_last_green:.0%} <= "
                     f"{config.SUCCESS_PROGRESS:.0%} のため失敗判定"
                 )
+
+            if config.PD_RECORD and (not config.IL_RECORD) and (not config.IL_USE_MODEL):
+                try:
+                    self._pd_record_episode_end(
+                        fish_box=self._pd_last_fish_box,
+                        bar_box=self._pd_last_bar_box,
+                        fish_name=self._current_fish_name or "",
+                        progress=_last_green,
+                        success=success,
+                        end_reason=end_reason,
+                    )
+                except Exception as e:
+                    log.warning(f"[PD_RECORD] episode_end 書き込み失敗: {e}")
 
             if config.IL_RECORD:
                 self._il_stop_recording()
@@ -1526,7 +1795,9 @@ class FishingBot:
             if key == 27:  # ESC
                 break
         try:
+
             cv2.destroyWindow("Debug Overlay")
+
         except Exception:
             pass
 
@@ -1896,9 +2167,9 @@ class FishingBot:
                 dt = now - self._bar_prev_time
                 if dt > 0.003:
                     raw_vel = (bar_cy_raw - self._bar_prev_cy) / dt
-                    α = min(config.VELOCITY_SMOOTH, 0.95)
+                    alpha = min(config.VELOCITY_SMOOTH, 0.95)
                     self._bar_velocity = (
-                        α * self._bar_velocity + (1 - α) * raw_vel
+                        alpha * self._bar_velocity + (1 - alpha) * raw_vel
                     )
             self._bar_prev_cy = bar_cy_raw
             self._bar_prev_time = now
@@ -1913,9 +2184,14 @@ class FishingBot:
         MAX_HOLD   = getattr(config, 'HOLD_MAX_S', 0.100)
         MIN_HOLD   = 0.004
 
+        # 収集用の既定値
+        action_press = 0
+        control_value = 0.0
+        in_deadzone = False
+
         if fish is not None and bar is not None:
             raw_fish_cy = fish[1] + fish[3] // 2
-            bar_cy      = bar[1]  + bar[3]  // 2
+            bar_cy      = bar[1] + bar[3] // 2
 
             # ── 鱼位置平滑 (EMA) ──
             if self._fish_smooth_cy is None:
@@ -1931,13 +2207,37 @@ class FishingBot:
             fish_in_bar = (fish_cy - bar_top) / bar_h
 
             # PD 计算
-            error = TARGET_FIB - fish_in_bar  # >0 需要上升, <0 需要下降
+            error = TARGET_FIB - fish_in_bar   # >0 需要上升, <0 需要下降
             error_clamp = max(-2.0, min(2.0, error))
 
             # hold = 基准 + 位置修正 + 速度阻尼
             # vel>0(下坠)→加hold减速; vel<0(上升)→减hold防过冲
             hold = BASE_HOLD + error_clamp * KP + vel * KD
             hold = max(MIN_HOLD, min(hold, MAX_HOLD))
+
+            # 教師データ用ラベル
+            action_press = 1 if hold >= MIN_HOLD + 0.001 else 0
+            control_value = float(hold)
+            in_deadzone = abs(error) < 0.05
+
+            # 直近観測を保存（episode_end 用）
+            self._pd_last_fish_box = fish
+            self._pd_last_bar_box = bar
+
+            # ここで1フレーム記録
+            if config.PD_RECORD and (not config.IL_RECORD) and (not config.IL_USE_MODEL):
+                self._pd_record_frame(
+                    fish_box=fish,
+                    bar_box=bar,
+                    fish_name=self._current_fish_name or "",
+                    action_press=action_press,
+                    control_value=control_value,
+                    in_deadzone=in_deadzone,
+                    progress=self._pd_last_progress,
+                    end_reason="",
+                    episode_done=0,
+                    episode_success=0,
+                )
 
             # 记录上次状态供后备使用
             self._last_hold = hold
@@ -1946,7 +2246,7 @@ class FishingBot:
             fname = (self._current_fish_name.replace("fish_", "")
                      if self._current_fish_name else "?")
 
-            if hold >= MIN_HOLD + 0.001:
+            if action_press:
                 self.input.mouse_down()
                 time.sleep(hold)
                 self.input.mouse_up()
@@ -1975,30 +2275,41 @@ class FishingBot:
         if fish is not None:
             fish_cy = fish[1] + fish[3] // 2
             self._last_fish_cy = fish_cy
-            # 鱼在上方(需要按)或下方(需要松)
+            self._pd_last_fish_box = fish
+
             if sr is not None:
                 mid_y = sr[1] + sr[3] // 2
             elif config.DETECT_ROI:
                 mid_y = config.DETECT_ROI[1] + config.DETECT_ROI[3] // 2
             else:
                 mid_y = fish_cy
+
             if fish_cy < mid_y:
                 h = min(fallback * 1.5, MAX_HOLD)
+                action_press = 1
+                control_value = float(h)
+                in_deadzone = False
+
                 self.input.mouse_down()
                 time.sleep(h)
                 self.input.mouse_up()
+
                 log.info(
                     f"  (仅鱼) Y={fish_cy} v={vel:+.0f}"
                     f" → 按 {h*1000:.0f}ms"
                 )
                 return True
             else:
+                action_press = 0
+                control_value = 0.0
+                in_deadzone = False
                 self.input.mouse_up()
                 return False
 
         elif bar is not None:
             bar_cy = bar[1] + bar[3] // 2
-            # 用上次鱼位置估算 fish_in_bar
+            self._pd_last_bar_box = bar
+
             if self._last_fish_cy is not None:
                 est_fib = (self._last_fish_cy - bar[1]) / max(bar[3], 1)
                 error = TARGET_FIB - est_fib
@@ -2007,6 +2318,11 @@ class FishingBot:
                 hold = max(MIN_HOLD, min(hold, MAX_HOLD))
             else:
                 hold = fallback
+
+            action_press = 1 if hold >= MIN_HOLD + 0.001 else 0
+            control_value = float(hold)
+            in_deadzone = False
+
             self.input.mouse_down()
             time.sleep(hold)
             self.input.mouse_up()
@@ -2098,6 +2414,7 @@ class FishingBot:
         if not config.IL_RECORD:
             self.input.safe_release()
         self.state = "已停止"
+        self._pd_close_recording()
         log.info("钓鱼线程已停止")
         try:
             cv2.destroyWindow("Debug Overlay")

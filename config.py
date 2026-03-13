@@ -166,8 +166,8 @@ ADAPTIVE_PD_HISTORY_LEN = 10
 ADAPTIVE_PD_BASE_KP = 0.040
 ADAPTIVE_PD_BASE_KD = 0.00025
 
-PD_RECORD = False
-PD_DATA_DIR = os.path.join(BASE_DIR, "data", "pd_sessions")
+PD_RECORD = True
+PD_DATA_DIR = os.path.join(BASE_DIR, "imitation", "data")
 
 # ═══════════════════════════════════════════════════════════
 #  模板文件映射
