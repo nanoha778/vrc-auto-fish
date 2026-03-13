@@ -264,9 +264,8 @@ class FishingBot:
     # PD教師データ収集
     # ══════════════════════════════════════════════════════
     def _pd_start_recording(self):
-        """PD教師データのCSVを開く（セッション単位で1ファイル）"""
-        if self._pd_writer is not None:
-            return
+        """PD教師データのCSVを開く（ミニゲーム単位で1ファイル）"""
+        self._pd_close_recording()
 
         os.makedirs(config.PD_DATA_DIR, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
@@ -276,35 +275,20 @@ class FishingBot:
         self._pd_writer = csv.writer(self._pd_file)
 
         self._pd_writer.writerow([
-            "episode_id",
-            "frame_idx",
-            "t",
+            "frame", "timestamp",
+            "fish_cy", "bar_cy", "bar_h",
+            "error", "velocity", "fish_delta", "dist_ratio",
+            "mouse_pressed",
+            "fish_in_bar", "press_streak",
+            "predicted", "bar_accel",
+
+            # 追加情報（train.py は無視する）
             "fish_name",
-
-            # 生値
-            "fish_cy",
-            "bar_cy",
-            "bar_h",
-
-            # IL互換 10特徴
-            "error",
-            "velocity",
-            "fish_delta",
-            "dist_ratio",
-            "mouse",
-            "fish_in_bar",
-            "press_streak",
-            "predicted",
-            "bar_accel",
-
-            # 教師
-            "action_press",
             "control_value",
             "in_deadzone",
-
-            # 解析用
             "progress",
             "end_reason",
+            "episode_id",
             "episode_done",
             "episode_success",
         ])
@@ -416,10 +400,8 @@ class FishingBot:
         feat = self._pd_extract_features(fish_box, bar_box)
 
         self._pd_writer.writerow([
-            self._pd_episode_id,
             self._pd_frame_idx,
-            time.time(),
-            fish_name or "",
+            f"{time.time():.4f}",
 
             feat["fish_cy"],
             feat["bar_cy"],
@@ -429,18 +411,19 @@ class FishingBot:
             feat["velocity"],
             feat["fish_delta"],
             feat["dist_ratio"],
-            feat["mouse"],
+            int(action_press),              # ← mouse_pressed
+
             feat["fish_in_bar"],
             feat["press_streak"],
             feat["predicted"],
             feat["bar_accel"],
 
-            int(action_press),
+            fish_name or "",
             float(control_value),
             int(bool(in_deadzone)),
-
             float(progress),
             end_reason,
+            self._pd_episode_id,
             int(episode_done),
             int(episode_success),
         ])
@@ -1572,6 +1555,8 @@ class FishingBot:
                     )
                 except Exception as e:
                     log.warning(f"[PD_RECORD] episode_end 書き込み失敗: {e}")
+                
+                self._pd_close_recording()
 
             if config.IL_RECORD:
                 self._il_stop_recording()
