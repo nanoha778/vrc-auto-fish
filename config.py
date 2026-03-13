@@ -65,6 +65,12 @@ UI_GONE_LIMIT       = 2            # 连续N次轨道检查失败 → 判定游�
 SUCCESS_CLICK_DELAY = 0.5
 POST_RELEASE_DELAY = 0
 
+
+ENABLE_SECTION_HEAD_ADJUST = True
+HEAD_ADJUST_FAIL_THRESHOLD = 5
+HEAD_ADJUST_SUCCESS_THRESHOLD = 3
+HEAD_ADJUST_STEP_SEC = 0.15
+
 # ═══════════════════════════════════════════════════════════
 #  模板匹配置信度阈值
 #  ★ ROI 框选后搜索范围极小, 误匹配风险很低, 阈值可大幅放宽

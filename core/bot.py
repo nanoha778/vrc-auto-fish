@@ -107,6 +107,11 @@ class FishingBot:
         self._bar_locked_cx  = None      # ★ 轨道X轴锁定 (白条+鱼共用)
         self._pool = ThreadPoolExecutor(max_workers=2)
 
+        # ── セクションごとの頭向き補正状態 ──
+        self._section_fail_streak = 0
+        self._section_success_streak = 0
+        self._section_head_adjust_active = False
+
         # ── 行为克隆 ──
         self._il_history = deque(maxlen=config.IL_HISTORY_LEN)
         self._il_writer = None       # CSV writer (录制模式)
@@ -256,6 +261,75 @@ class FishingBot:
         except Exception:
             pass
         time.sleep(config.CAST_DELAY)
+
+    
+    # ───────────────── 头向き補正の更新 ──────────────────
+
+    def _update_section_head_adjust(self, result: bool):
+        """
+        長期間失敗時の頭向き補正。
+
+        仕様:
+        - 連続失敗が閾値以上で補正モード開始
+        - 補正モード中は、成功/失敗に関係なく毎セクション右へ step_sec
+        - 成功したセクションだけ success_count を加算
+        - success_count が閾値以上になったら、左へ step_sec を2回送って終了
+        """
+        if not getattr(config, "ENABLE_SECTION_HEAD_ADJUST", False):
+            return
+
+        step_sec = getattr(config, "HEAD_ADJUST_STEP_SEC", 0.3)
+        fail_th = getattr(config, "HEAD_ADJUST_FAIL_THRESHOLD", 5)
+        success_th = getattr(config, "HEAD_ADJUST_SUCCESS_THRESHOLD", 3)
+
+        # ── 補正モード前 ──
+        if not self._section_head_adjust_active:
+            if result:
+                self._section_fail_streak = 0
+                return
+
+            # 失敗（未検出含む）
+            self._section_fail_streak += 1
+            log.info(
+                f"[头向き補正] 失敗カウント "
+                f"{self._section_fail_streak}/{fail_th}"
+            )
+
+            if self._section_fail_streak < fail_th:
+                return
+
+            # 閾値到達で補正開始
+            self._section_head_adjust_active = True
+            self._section_success_streak = 0
+            log.warning(
+                f"[头向き補正] 連続失敗 {self._section_fail_streak}/{fail_th} に到達。補正開始"
+            )
+
+        # ── 補正モード中 ──
+        # 成功/失敗に関係なく毎セクション右へ補正
+        log.info(f"[头向き補正] 右へ {step_sec:.1f}s 補正を入れます")
+        self.input.look_right_for(step_sec)
+
+        if result:
+            self._section_success_streak += 1
+            log.info(
+                f"[头向き補正] 成功カウント "
+                f"{self._section_success_streak}/{success_th}"
+            )
+
+            if self._section_success_streak >= success_th:
+                log.info(
+                    f"[头向き補正] 成功しきい値到達。"
+                    f"左へ {step_sec:.1f}s を2回送って補正終了"
+                )
+                self.input.look_left_for(step_sec)
+                self.input.look_left_for(step_sec)
+
+                self._section_head_adjust_active = False
+                self._section_success_streak = 0
+                self._section_fail_streak = 0
+        else:
+            log.info("[头向き補正] 失敗したが、成功カウントは維持して継続")
 
     # ══════════════════════════════════════════════════════
     #  第2步: 等待咬钩
@@ -1978,30 +2052,21 @@ class FishingBot:
 
                     # ★ 验证小游戏是否真的出现了
                     if not self._verify_minigame():
-                        self._retry_no_minigame_count += 1
-                        
-                        # 检查是否达到强制重置条件
-                        if (config.ENABLE_FORCE_RESET and 
-                            self._retry_no_minigame_count >= config.MAX_RETRY_NO_MINIGAME):
-                            wait = config.FORCE_RESET_DELAY
-                            timestamp = self._record_force_reset()  # 记录日志
-                            log.warning(f"[⚠️ 强制重置] 连续{self._retry_no_minigame_count}次未检测到小游戏, "
-                                      f"等待{wait:.1f}s让游戏自动重置...")
-                            log.info(f"[📋 记录] 第 {self._force_reset_count} 次强制重置 @ {timestamp}")
-                            self.input.click()
-                            time.sleep(wait)
-                            self._retry_no_minigame_count = 0  # 重置计数器
-                            log.info("[🔄 继续] 强制重置完成, 重新抛竿")
-                        else:
-                            wait = config.POST_CATCH_DELAY
-                            log.info(f"[🔄 重试] 未检测到小游戏({self._retry_no_minigame_count}/"
-                                     f"{config.MAX_RETRY_NO_MINIGAME}), 收杆后等待{wait:.1f}s重新抛竿")
-                            self.input.click()
-                            time.sleep(wait)
+                        log.info("[❌ 未検出] ミニゲーム未検出 → 失敗として処理")
+
+                        result = False
+                        self.fish_count += 1
+                        self.fail_count += 1
+
+                        # 頭向き補正ロジック更新
+                        self._update_section_head_adjust(result)
+
+                        log.info(f"[🎣 结果] 第 {self.fish_count} 次钓鱼 — 未检测 ❌ "
+                                f"(累计: 成功{self.success_count}/失败{self.fail_count})")
                         log.info("─" * 40)
+
                         continue
                     else:
-                        # 检测到小游戏，重置计数器
                         self._retry_no_minigame_count = 0
 
                 if not self.running:
@@ -2018,6 +2083,7 @@ class FishingBot:
                     tag = "失败 ❌"
                 log.info(f"[🎣 结果] 第 {self.fish_count} 次钓鱼 — {tag} "
                          f"(累计: 成功{self.success_count}/失败{self.fail_count})")
+                self._update_section_head_adjust(result)
                 log.info("─" * 40)
 
                 self.state = "等待下一轮"
