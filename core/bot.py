@@ -22,9 +22,144 @@ from utils.logger import log
 import ctypes
 import csv
 from collections import deque
+import math
+import random
+import pickle
 
 _yolo_detector = None
 _yolo_device_used = None
+
+class OnlineHoldRL:
+    """
+    PDが出した base_hold に対して delta_hold を選ぶだけの超軽量オンライン学習器。
+    離散行動 + Q学習で、bot.py直書き向けの最小構成。
+    """
+
+    def __init__(self):
+        # 押下時間補正候補（秒）
+        self.actions = [-0.03, -0.015, -0.008, 0.0, 0.008, 0.015, 0.03]
+
+        # Q学習パラメータ
+        self.lr = 0.08
+        self.gamma = 0.92
+        self.epsilon = 0.3
+        self.epsilon_min = 0.03
+        self.epsilon_decay = 0.9995
+
+        # Qテーブル
+        self.q = {}
+
+        # 直前状態保持
+        self.prev_state = None
+        self.prev_action = None
+        self.prev_hold = 0.0
+
+        # 学習統計
+        self.total_steps = 0
+        self.total_updates = 0
+        self.last_reward = 0.0
+
+        # 保存先
+        self.save_path = "adaptive_hold_q.pkl"
+
+    def _discretize(self, error, d_error, fish_speed=0.0, bar_speed=0.0):
+        def clip(v, lo, hi):
+            return max(lo, min(hi, v))
+
+        e_bin = int(round(clip(error * 8.0, -6, 6)))
+        de_bin = int(round(clip(d_error * 10.0, -6, 6)))
+        fs_bin = int(round(clip(fish_speed * 8.0, -4, 4)))
+        bs_bin = int(round(clip(bar_speed * 8.0, -4, 4)))
+        h_bin = int(round(clip(self.prev_hold * 50.0, 0, 10)))
+
+        return (e_bin, de_bin, fs_bin, bs_bin, h_bin)
+
+    def _ensure_state(self, state):
+        if state not in self.q:
+            self.q[state] = [0.0 for _ in range(len(self.actions))]
+
+    def select_action(self, state):
+        self._ensure_state(state)
+        if random.random() < self.epsilon:
+            return random.randrange(len(self.actions))
+        qvals = self.q[state]
+        best_idx = max(range(len(qvals)), key=lambda i: qvals[i])
+        return best_idx
+
+    def compute_hold(self, base_hold, action_idx, min_hold=0.0, max_hold=0.20):
+        hold = base_hold + self.actions[action_idx]
+        hold = max(min_hold, min(max_hold, hold))
+        self.prev_hold = hold
+        return hold
+
+    def step_reward(self, error, prev_error=None):
+        """
+        error: 0に近いほど良い
+        prev_error: 1ステップ前の error
+        """
+        abs_err = abs(error)
+
+        reward = 0.0
+
+        # 現在のズレが小さいほど良い
+        reward -= abs_err * 0.25
+
+        # 前ステップより改善していれば加点
+        if prev_error is not None:
+            reward += (abs(prev_error) - abs_err) * 0.5
+
+        # 長押ししすぎをわずかに抑制
+        reward -= self.prev_hold * 0.02
+
+        self.last_reward = reward
+        return reward
+
+    def update(self, state, action_idx, reward, next_state, done):
+        self._ensure_state(state)
+        self._ensure_state(next_state)
+
+        q_sa = self.q[state][action_idx]
+        next_max = 0.0 if done else max(self.q[next_state])
+
+        self.q[state][action_idx] = q_sa + self.lr * (
+            reward + self.gamma * next_max - q_sa
+        )
+
+        self.total_updates += 1
+        self.total_steps += 1
+
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+            if self.epsilon < self.epsilon_min:
+                self.epsilon = self.epsilon_min
+
+    def reset_episode(self):
+        self.prev_state = None
+        self.prev_action = None
+        self.prev_hold = 0.0
+
+    def save(self):
+        try:
+            with open(self.save_path, "wb") as f:
+                pickle.dump({
+                    "q": self.q,
+                    "epsilon": self.epsilon,
+                    "total_steps": self.total_steps,
+                    "total_updates": self.total_updates,
+                }, f)
+        except Exception:
+            pass
+
+    def load(self):
+        try:
+            with open(self.save_path, "rb") as f:
+                data = pickle.load(f)
+            self.q = data.get("q", {})
+            self.epsilon = data.get("epsilon", self.epsilon)
+            self.total_steps = data.get("total_steps", 0)
+            self.total_updates = data.get("total_updates", 0)
+        except Exception:
+            pass
 
 def _get_yolo_detector(force_reload=False):
     """延迟加载 YOLO 检测器（避免未安装 ultralytics 时报错）"""
@@ -76,6 +211,19 @@ class FishingBot:
         self.success_count = 0       # 钓鱼成功次数
         self.fail_count = 0          # 钓鱼失败次数
         self.state      = "就绪"
+
+        # --- Adaptive PD + Online RL ---
+        self.rl_hold = OnlineHoldRL()
+        self.rl_hold.load()
+
+        self.rl_enabled = True
+        self.rl_save_every_fish = 10
+        self.rl_fish_counter = 0
+
+        # 直前観測
+        self._rl_prev_error = 0.0
+        self._rl_prev_bar_y = 0.0
+        self._rl_prev_fish_y = 0.0
 
         # ── PD 控制器状态 ──
         self._bar_prev_cy   = None       # 上一帧白条中心 Y
@@ -263,6 +411,28 @@ class FishingBot:
     # ══════════════════════════════════════════════════════
     # PD教師データ収集
     # ══════════════════════════════════════════════════════
+    def _clamp(self, v, lo, hi):
+        return max(lo, min(hi, v))
+
+    def _pd_to_base_hold(self, error, d_error):
+        """
+        PD出力をベース押下時間に変換する。
+        ここは最初かなり素朴でOK。
+        error, d_error は -1.0~1.0 前後を想定。
+        """
+        # 既存の adaptive_pd があるなら、その出力を使ってOK
+        signal = 0.11 * error + 0.045 * d_error
+
+        # 正方向だけ押す想定ならこう
+        if signal <= 0:
+            return 0.0
+
+        # 適当に秒へ変換
+        base_hold = signal * 0.10
+
+        # 上限は短めから始める
+        return self._clamp(base_hold, 0.0, 0.16)
+
     def _pd_start_recording(self):
         """PD教師データのCSVを開く（ミニゲーム単位で1ファイル）"""
         self._pd_close_recording()
@@ -772,6 +942,13 @@ class FishingBot:
         self._il_press_streak = 0
         self._il_prev_velocity = 0.0
         self._il_log_counter = 0
+
+        # ── RL状態リセット ──
+        if self.rl_enabled:
+            self.rl_hold.reset_episode()
+            self._rl_prev_error = 0.0
+            self._rl_prev_bar_y = 0.0
+            self._rl_prev_fish_y = 0.0
 
         # ── PD教師データ収集: 毎回リセット ──
         if config.PD_RECORD and (not config.IL_RECORD) and (not config.IL_USE_MODEL):
@@ -1542,7 +1719,6 @@ class FishingBot:
                     f"[❌ 失敗] 最終進捗 {_last_green:.0%} <= "
                     f"{config.SUCCESS_PROGRESS:.0%} のため失敗判定"
                 )
-
             if config.PD_RECORD and (not config.IL_RECORD) and (not config.IL_USE_MODEL):
                 try:
                     self._pd_record_episode_end(
@@ -1592,7 +1768,10 @@ class FishingBot:
                             log.info(f"[YOLO] 失敗時画像を保存しました: fail_{_ts}_{_ms:03d}.png")
                         except Exception as e:
                             log.warning(f"[YOLO] 失敗時画像の保存中に例外: {e}")
-
+            if self.rl_enabled:
+                self.rl_fish_counter += 1
+                if self.rl_fish_counter % self.rl_save_every_fish == 0:
+                    self.rl_hold.save()
         return success
 
     # ══════════════════════════════════════════════════════
@@ -2142,6 +2321,15 @@ class FishingBot:
 
         返回: 是否执行了按住操作
         """
+
+        if sr is not None:
+            screen_h = float(sr[3])
+        elif config.DETECT_ROI:
+            screen_h = float(config.DETECT_ROI[3])
+        else:
+            screen_h = 1080.0
+
+
         now = time.time()
 
         # ═══════════ ★ 速度估算: 只要检测到白条就更新 ═══════════
@@ -2192,18 +2380,69 @@ class FishingBot:
             fish_in_bar = (fish_cy - bar_top) / bar_h
 
             # PD 计算
-            error = TARGET_FIB - fish_in_bar   # >0 需要上升, <0 需要下降
+            error = TARGET_FIB - fish_in_bar
             error_clamp = max(-2.0, min(2.0, error))
 
-            # hold = 基准 + 位置修正 + 速度阻尼
-            # vel>0(下坠)→加hold减速; vel<0(上升)→减hold防过冲
-            hold = BASE_HOLD + error_clamp * KP + vel * KD
-            hold = max(MIN_HOLD, min(hold, MAX_HOLD))
+            # 従来PDのベース押下
+            pd_hold = BASE_HOLD + error_clamp * KP + vel * KD
+            pd_hold = max(0.0, min(MAX_HOLD, pd_hold))
 
-            # 教師データ用ラベル
+            # RL用の正規化誤差
+            error_norm = max(-1.0, min(1.0, error_clamp / 2.0))
+            prev_error_norm = self._rl_prev_error
+            d_error = error_norm - prev_error_norm
+
+            fish_y_norm = fish_cy / max(1.0, screen_h)
+            bar_y_norm = bar_cy / max(1.0, screen_h)
+
+            fish_velocity = fish_y_norm - self._rl_prev_fish_y
+            bar_velocity = bar_y_norm - self._rl_prev_bar_y
+
+            if self.rl_enabled:
+                state = self.rl_hold._discretize(
+                    error=error_norm,
+                    d_error=d_error,
+                    fish_speed=fish_velocity,
+                    bar_speed=bar_velocity,
+                )
+
+                action_idx = self.rl_hold.select_action(state)
+
+                hold = self.rl_hold.compute_hold(
+                    base_hold=pd_hold,
+                    action_idx=action_idx,
+                    min_hold=0.0,
+                    max_hold=MAX_HOLD,
+                )
+
+                reward = self.rl_hold.step_reward(
+                    error=error_norm,
+                    prev_error=prev_error_norm,
+                )
+
+                if self.rl_hold.prev_state is not None and self.rl_hold.prev_action is not None:
+                    self.rl_hold.update(
+                        state=self.rl_hold.prev_state,
+                        action_idx=self.rl_hold.prev_action,
+                        reward=reward,
+                        next_state=state,
+                        done=False,
+                    )
+
+                self.rl_hold.prev_state = state
+                self.rl_hold.prev_action = action_idx
+            else:
+                hold = pd_hold
+
             action_press = 1 if hold >= MIN_HOLD + 0.001 else 0
             control_value = float(hold)
             in_deadzone = abs(error) < 0.05
+
+            self._rl_prev_error = error_norm
+            self._rl_prev_fish_y = fish_y_norm
+            self._rl_prev_bar_y = bar_y_norm
+
+            hold = max(0.0, min(hold, MAX_HOLD))
 
             # 直近観測を保存（episode_end 用）
             self._pd_last_fish_box = fish
@@ -2237,14 +2476,18 @@ class FishingBot:
                 self.input.mouse_up()
                 log.info(
                     f"  ● [{fname}] fib={fish_in_bar:.2f} "
-                    f"v={vel:+.0f} → 按 {hold*1000:.0f}ms"
+                    f"v={vel:+.0f} hold={hold*1000:.0f}ms "
+                    f"reward={self.rl_hold.last_reward:+.3f} "
+                    f"eps={self.rl_hold.epsilon:.3f}"
                 )
                 return True
             else:
                 self.input.mouse_up()
                 log.info(
                     f"  ○ [{fname}] fib={fish_in_bar:.2f} "
-                    f"v={vel:+.0f} → 释放"
+                    f"v={vel:+.0f} hold=0ms "
+                    f"reward={self.rl_hold.last_reward:+.3f} "
+                    f"eps={self.rl_hold.epsilon:.3f} → 释放"
                 )
                 return False
 
@@ -2399,6 +2642,8 @@ class FishingBot:
         if not config.IL_RECORD:
             self.input.safe_release()
         self.state = "已停止"
+        if self.rl_enabled:
+            self.rl_hold.save()
         self._pd_close_recording()
         log.info("钓鱼线程已停止")
         try:
