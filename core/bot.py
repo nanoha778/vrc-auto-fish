@@ -12,12 +12,15 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+
 import config
 from core.window import WindowManager
 from core.screen import ScreenCapture
 from core.detector import ImageDetector
 from core.input_ctrl import InputController
 from utils.logger import log
+from imitation.hybrid_policy import HybridPolicyController
+from imitation.adaptive_pd import AdaptivePDController
 
 import ctypes
 import csv
@@ -61,6 +64,16 @@ class FishingBot:
         self.screen   = ScreenCapture()
         self.detector = ImageDetector(config.IMG_DIR, config.TEMPLATE_FILES)
         self.input    = InputController(self.window)
+        self.adaptive_pd = AdaptivePDController(
+            history_len=getattr(config, "ADAPTIVE_PD_HISTORY_LEN", 10),
+            base_kp=getattr(config, "ADAPTIVE_PD_BASE_KP", config.HOLD_GAIN),
+            base_kd=getattr(config, "ADAPTIVE_PD_BASE_KD", config.SPEED_DAMPING),
+            min_hold=config.HOLD_MIN_S,
+            max_hold=config.HOLD_MAX_S,
+        )
+
+        if getattr(config, "USE_ADAPTIVE_PD", False):
+            self._load_adaptive_pd_policy()
 
         self.yolo = None
         if config.USE_YOLO:
@@ -141,12 +154,50 @@ class FishingBot:
         self._il_device = "cpu"
         self._il_norm_mean = None    # 特征归一化均值
         self._il_norm_std = None     # 特征归一化标准差
+
+        self._pd_writer = None
+        self._pd_file = None
+        self._pd_prev_fish_cy = None
+        self._pd_prev_velocity = 0.0
+        self._pd_log_counter = 0
+        self._pd_last_press = False
+        self._pd_last_hold_decision = 0.0
+
         if config.IL_USE_MODEL:
             self._load_il_policy()
+
+        self.hybrid_policy = HybridPolicyController(
+            model_path=config.IL_MODEL_PATH,
+            history_len=config.IL_HISTORY_LEN,
+            assist_band=config.IL_ASSIST_BAND,
+            strong_press=config.IL_STRONG_PRESS,
+            strong_release=config.IL_STRONG_RELEASE,
+        )
+        self._press_streak = 0
+        self._prev_mouse_pressed = 0.0
+        self._adaptive_prev_velocity = 0.0
 
     # ══════════════════════════════════════════════════════
     #  截取游戏画面
     # ══════════════════════════════════════════════════════
+
+    def _load_adaptive_pd_policy(self):
+        model_path = getattr(config, "ADAPTIVE_PD_MODEL_PATH", None)
+        if not model_path:
+            log.warning("[AdaptivePD] モデルパス未設定")
+            return
+
+        if not os.path.exists(model_path):
+            log.warning(f"[AdaptivePD] モデルが見つかりません: {model_path}")
+            return
+
+        try:
+            from stable_baselines3 import PPO
+            policy = PPO.load(model_path)
+            self.adaptive_pd.set_policy(policy)
+            log.info(f"[AdaptivePD] PPOモデルを読み込みました: {model_path}")
+        except Exception as e:
+            log.warning(f"[AdaptivePD] モデル読み込み失敗: {e}")
 
     def _grab(self):
         """截取 VRChat 窗口客户区，保证返回非空 BGR 图像"""
@@ -762,16 +813,31 @@ class FishingBot:
     # ══════════════════════════════════════════════════════
 
     def _fishing_minigame(self) -> bool:
-        self.state = "ミニゲーム中"
-        log.info("[🐟 釣り] ミニゲーム開始")
+        if (
+            config.PD_RECORD
+            and not config.IL_RECORD
+            and not getattr(config, "USE_ADAPTIVE_PD", False)
+            and not config.IL_USE_HYBRID
+            and not config.IL_USE_MODEL
+        ):
+            self._pd_start_recording()
 
-        # ── 行動クローニング: 毎回リセット ──
+        self.state = "小游戏进行中"
+        log.info("[🐟 钓鱼] 小游戏开始")
+
+        # ── 行为克隆: 每局重置状态 ──
         self._il_history.clear()
         self._il_prev_fish_cy = None
         self._il_mouse_prev = 0
         self._il_press_streak = 0
         self._il_prev_velocity = 0.0
         self._il_log_counter = 0
+        self.hybrid_policy.reset()
+        self._press_streak = 0
+        self._prev_mouse_pressed = 0.0
+        self.adaptive_pd.reset()
+        self._adaptive_prev_velocity = 0.0
+        
 
         # ── PD教師データ収集: 毎回リセット ──
         if config.PD_RECORD and (not config.IL_RECORD) and (not config.IL_USE_MODEL):
@@ -781,82 +847,89 @@ class FishingBot:
 
         if config.IL_RECORD:
             self._il_start_recording()
-            log.info("[IL] 録画モード: マウスを手動操作して白バーを制御してください")
+            log.info("[IL] 录制模式: 请手动操作鼠标控制白条!")
         elif config.IL_USE_MODEL:
             if self._il_policy is None:
                 self._load_il_policy()
             if self._il_policy is not None:
-                log.info("[IL] ★ 今回は行動クローニングモデルで制御します ★")
+                log.info("[IL] ★ 本局使用行为克隆模型控制 ★")
             else:
-                log.warning("[IL] モデルの読み込みに失敗したため、PD制御にフォールバックします")
+                log.warning("[IL] 模型加载失败, 回退到 PD 控制器")
         else:
-            log.info("[PD] 今回はPD制御を使用します")
+            log.info("[PD] 本局使用 PD 控制器")
 
-        # ★ YOLO モード（初回使用時に遅延ロード）
+        # ★ YOLO 模式 (延迟加载: 首次使用时加载)
         if config.USE_YOLO and self.yolo is None:
             try:
                 self.yolo = _get_yolo_detector()
             except Exception as e:
-                log.warning(f"[YOLO] 読み込み失敗: {e}。テンプレートマッチングにフォールバックします")
+                log.warning(f"[YOLO] 加载失败: {e}，回退到模板匹配")
         _use_yolo = config.USE_YOLO and self.yolo is not None
         if _use_yolo:
-            log.info("[YOLO] YOLO 目標検出を使用します")
+            log.info("[YOLO] 使用 YOLO 目标检测")
 
-        # ★ 最初の数秒だけ詳細デバッグを有効化
+        # ★ 前几秒开启调试报告（便于排查检测问题）
         self.detector.debug_report = True
 
-        # ★ PostMessage モードでは前面化不要、クリック座標だけ更新
+        # ★ PostMessage 模式不需要前台聚焦, 只更新点击坐标
         self.input.move_to_game_center()
 
         no_detect = 0
-        fish_lost = 0              # ★ 連続で魚を見失ったフレーム数
+        fish_lost = 0          # ★ 连续鱼消失帧数
         frame = 0
-        hold_count = 0             # 押下回数
+        hold_count = 0         # 按住次数
         success = False
-        _skip_fish = False         # ★ ホワイトリスト対象外の魚なら放棄
-        _fish_id_saved = False     # ★ 魚種識別デバッグ画像は1回だけ保存
-        self._progress_debug_saved = False
-        minigame_start = time.time()
-        ui_gone_count = 0          # ★ UI消失カウンタ
-        had_good_detection = False # ★ 一度でも魚+バーを正常検出したか
-        track_alive = True         # ★ 軌道が存在しているか
-        obj_gone_count = 0         # ★ 検出対象不足の連続フレーム数
-        fish_gone_since = None     # ★ 魚を見失い始めた時刻
-        bar_gone_since = None      # ★ 白バーを見失い始めた時刻
+        _skip_fish = False     # ★ 白名单跳过标志: 非目标鱼→放弃控制
+        _fish_id_saved = False # ★ 鱼种识别截图只保存一次
+        self._progress_debug_saved = False  # ★ 进度条截图只保存一次
+        minigame_start = time.time()   # ★ 计时: 超时强制结束
+        ui_gone_count = 0              # ★ UI消失计数器
+        had_good_detection = False     # ★ 是否曾经成功检测到鱼+条
+        track_alive = True             # ★ 轨道是否存活 (定期更新)
+        obj_gone_count = 0             # ★ 连续对象不足帧数
+        fish_gone_since = None         # ★ 鱼消失开始时间
+        bar_gone_since  = None         # ★ 白条消失开始时间
 
-        # ── PD制御状態をリセット ──
-        self._bar_prev_cy = None
+        # ── 瞬时丢失保护: fish / bar 保持最近5帧 ──
+        _HOLD_FRAMES = 2
+        _last_fish_box = None
+        _last_bar_box = None
+        _fish_hold_left = 0
+        _bar_hold_left = 0
+
+        # ── 重置 PD 控制器 ──
+        self._bar_prev_cy   = None
         self._bar_prev_time = None
-        self._bar_velocity = 0.0
-        self._last_hold = None
-        self._last_fish_cy = None
+        self._bar_velocity  = 0.0
+        self._last_hold     = None
+        self._last_fish_cy  = None
         self._fish_smooth_cy = None
-        self._bar_locked_cx = None
+        self._bar_locked_cx  = None
 
-        # ── テンプレートロック用（後続フレーム高速化） ──
-        locked_fish_key = None
-        locked_fish_scales = None
-        locked_bar_scales = None
+        # ── 模板锁定变量（加速后续帧检测） ──
+        locked_fish_key = None       # 如 "fish_blue"
+        locked_fish_scales = None    # 如 [0.4, 0.5, 0.6]
+        locked_bar_scales = None     # 如 [0.4, 0.5, 0.6]
         _BAR_X_HALF = config.REGION_X
         _FISH_X_HALF = max(config.REGION_X * 2, 80)
 
-        # 初期画面取得
+        # 初始化搜索区域
         screen_orig = self._grab()
 
-        # ★ ミニゲーム開始時の原寸スクリーンショット保存
+        # ★ 始终保存小游戏首帧截图 (原始未旋转)
         self.screen.save_debug(screen_orig, "minigame_start")
         h_orig, w_orig = screen_orig.shape[:2]
-        log.info(f"  スクリーンショットサイズ: {w_orig}×{h_orig}")
+        log.info(f"  截图尺寸: {w_orig}×{h_orig}")
 
-        # ★ 初期化段階でも debug overlay を表示
+        # ★ 初始化阶段也刷新 debug 窗口
         self._show_debug_overlay(
-            screen_orig, status_text="🐟 ミニゲーム初期化中..."
+            screen_orig, status_text="🐟 小游戏初始化..."
         )
 
         if self._need_rotation:
             log.info(
-                f"  ► 軌道が {self._track_angle:.1f}° 傾いているため、"
-                f" 回転補正を有効化します（{-self._track_angle:.1f}° 回転）"
+                f"  ► 轨道倾斜 {self._track_angle:.1f}°, "
+                f"启用旋转补偿 (旋转 {-self._track_angle:.1f}°)"
             )
             screen = self._rotate_for_detection(screen_orig)
         else:
@@ -870,12 +943,12 @@ class FishingBot:
             _regions_locked = True
             if config.DETECT_ROI:
                 log.info(
-                    f"  [YOLO] ROI を使用: "
+                    f"  [YOLO] 使用 ROI: "
                     f"X={config.DETECT_ROI[0]} Y={config.DETECT_ROI[1]} "
                     f"{config.DETECT_ROI[2]}x{config.DETECT_ROI[3]}"
                 )
             else:
-                log.info("  [YOLO] 全画面検出")
+                log.info("  [YOLO] 全屏检测")
         else:
             search_region, track_cx, bar_search_region = \
                 self._init_search_region(screen)
@@ -883,26 +956,26 @@ class FishingBot:
 
             if track_cx is not None:
                 self._bar_locked_cx = track_cx
-                log.info(f"  ★ 軌道X軸を事前ロック: X={track_cx}")
+                log.info(f"  ★ 轨道X轴预锁定: X={track_cx}")
 
             if search_region:
                 srx, sry, srw, srh = search_region
                 log.info(
-                    f"  初期魚探索範囲: X={srx}~{srx+srw} Y={sry}~{sry+srh}"
+                    f"  初始鱼搜索: X={srx}~{srx+srw} Y={sry}~{sry+srh}"
                 )
             if bar_search_region:
                 bsx, bsy, bsw, bsh = bar_search_region
                 log.info(
-                    f"  初期白バー探索範囲: X={bsx}~{bsx+bsw} "
-                    f"Y={bsy}~{bsy+bsh} (下半分)"
+                    f"  初始白条搜索: X={bsx}~{bsx+bsw} "
+                    f"Y={bsy}~{bsy+bsh} (下半屏)"
                 )
 
-        # ★ 開幕の安定押し
+        # ★ 开局稳定按压: 白条会从中间快速坠落，两次按压恢复惯性
         if config.IL_RECORD:
-            log.info("  ► 録画モードのため開幕押下はスキップ。手動で操作してください")
+            log.info("  ► 录制模式 — 跳过开局按压, 请手动控制")
         else:
             press_t = getattr(config, 'INITIAL_PRESS_TIME', 0.2)
-            log.info(f"  ► 開幕遅延 0.5秒 + 押下 {press_t}s")
+            log.info(f"  ► 开局延迟0.5s + 按压{press_t}s")
             time.sleep(0.5)
             self.input.mouse_down()
             time.sleep(press_t)
@@ -911,31 +984,12 @@ class FishingBot:
         _last_progress_sr = None
         _last_track_w = None
         _last_green = 0.0
-        _PROGRESS_SKIP_FRAMES = 0
+        _PROGRESS_SKIP_FRAMES = 20
         _prev_green = 0.0
-
-        # ── 直前5フレーム補完用バッファ ──
-        recent_fish = deque(maxlen=5)
-        recent_bar = deque(maxlen=5)
-        recent_progress = deque(maxlen=5)
-
-        def _push_recent(buf, value, frame_no):
-            if value is not None:
-                buf.append((frame_no, value))
-
-        def _get_recent(buf, frame_no, max_age=5):
-            for fno, val in reversed(buf):
-                if frame_no - fno <= max_age:
-                    return val
-            return None
-
-        end_reason = "unknown"
-
         try:
             while self.running:
                 frame += 1
-
-                # ★ FPS計算
+                # ★ FPS 计算
                 now_t = time.time()
                 self._frame_times.append(now_t)
                 if len(self._frame_times) > 20:
@@ -949,17 +1003,16 @@ class FishingBot:
                 screen = self._rotate_for_detection(screen_raw) \
                     if self._need_rotation else screen_raw
 
-                # ════════════ タイムアウト判定 ════════════
+                # ════════════ 超时检测 ════════════
                 elapsed = time.time() - minigame_start
                 if elapsed > config.MINIGAME_TIMEOUT:
                     log.info(
-                        f"[⏱ タイムアウト] ミニゲームが {elapsed:.0f}s 続き、"
-                        f"制限 {config.MINIGAME_TIMEOUT:.0f}s を超えたため終了します"
+                        f"[⏱ 超时] 小游戏已进行 {elapsed:.0f}s，"
+                        f"超过 {config.MINIGAME_TIMEOUT:.0f}s 限制，强制结束"
                     )
-                    end_reason = "minigame_timeout"
                     break
 
-                # ════════════ 定期的にUI存在確認 ════════════
+                # ════════════ 定期检查 UI 是否还存在 ════════════
                 if frame % config.UI_CHECK_FRAMES == 0 and frame > 10:
                     if _use_yolo:
                         _tc = self.yolo.detect(screen, config.DETECT_ROI)
@@ -968,27 +1021,25 @@ class FishingBot:
                         track_check = self.detector.find_multiscale(
                             screen, "track", 0.50
                         )
-
                     if track_check is None:
                         ui_gone_count += 1
                         track_alive = False
                         log.info(
-                            f"[⚠ UI確認] 軌道を検出できません "
+                            f"[⚠ UI检查] 轨道未检测到 "
                             f"({ui_gone_count}/{config.UI_GONE_LIMIT})"
                         )
                         if ui_gone_count >= config.UI_GONE_LIMIT:
-                            log.info("[📋 終了] ミニゲームUIが消えたため終了します")
-                            end_reason = "ui_gone_limit"
+                            log.info("[📋 结束] 小游戏UI已消失，游戏结束!")
                             break
                     else:
                         ui_gone_count = 0
                         track_alive = True
 
-                # ★ 60フレームごとにカーソル位置を安全補正
+                # ★ 每60帧确保鼠标在游戏窗口内
                 if frame % 60 == 0:
                     self.input.ensure_cursor_in_game()
 
-                # ════════════ 連続ロスト時は軽量探索 ════════════
+                # ════════════ ★ 连续丢失时跳过昂贵的全量搜索 ════════════
                 if no_detect > 3 and not _use_yolo:
                     bar_quick = self.detector.find_multiscale(
                         screen, "bar", config.THRESH_BAR,
@@ -996,7 +1047,8 @@ class FishingBot:
                         scales=locked_bar_scales or config.BAR_SCALES,
                     )
                     if bar_quick is not None:
-                        log.info(f"[✓ 復帰] {no_detect}フレーム見失い後に白バー再検出")
+                        # UI可能恢复了, 重置计数让下一帧做完整检测
+                        log.info(f"[✓ 恢复] 丢失{no_detect}帧后重新检测到白条")
                         no_detect = 0
                     else:
                         no_detect += 1
@@ -1004,39 +1056,37 @@ class FishingBot:
                             self.input.mouse_up()
                         if no_detect > config.TRACK_LOST_LIMIT:
                             log.info(
-                                f"[📋 終了] {no_detect}フレーム連続で"
-                                f"有効UIを検出できなかったため終了します"
+                                f"[📋 结束] 连续{no_detect}帧未检测到"
+                                f"有效UI，游戏已结束"
                             )
-                            end_reason = "track_lost_limit_quick"
                             break
-
+                        # ★ debug 窗口仍然刷新
                         self._show_debug_overlay(
                             screen_raw,
-                            status_text=f"⚠ 見失い中 {no_detect}/{config.TRACK_LOST_LIMIT}"
+                            status_text=f"⚠ 丢失中 {no_detect}/{config.TRACK_LOST_LIMIT}"
                         )
                         time.sleep(config.GAME_LOOP_INTERVAL)
                         continue
 
-                # ════════════ 魚 + 白バー検出 ════════════
+                # ════════════ 检测鱼 + 白条 ════════════
                 fish = None
                 bar = None
                 fish_detect_name = ""
                 _matched_key = None
                 _bar_scale = 1.0
-                _yolo_progress = None
 
+                _yolo_progress = None
                 if _use_yolo:
+                    # ──── YOLO: 一次推理检测全部 ────
                     _yolo_roi = config.DETECT_ROI
                     _ydet = self.yolo.detect(screen, roi=_yolo_roi)
                     fish = _ydet["fish"]
                     bar = _ydet["bar"]
                     _yolo_progress = _ydet.get("progress")
-
                     if fish is not None:
                         _save = not _fish_id_saved
                         _color_key = self.detector.identify_fish_type(
-                            screen, fish, debug_save=_save
-                        )
+                            screen, fish, debug_save=_save)
                         if _save:
                             _fish_id_saved = True
                         _matched_key = _color_key
@@ -1045,7 +1095,8 @@ class FishingBot:
                         _matched_key = None
                         fish_detect_name = ""
 
-                    # YOLOデータ収集（非失敗時収集）
+                    # YOLO 数据采集: 保存完整窗口画面（不裁剪ROI）
+                    # 仅在非"失败采集模式"时正常采集，每60秒保存一次
                     _now = time.time()
                     if config.YOLO_COLLECT and not config.YOLO_COLLECT_ON_FAIL:
                         if not hasattr(self, '_yolo_last_collect_time'):
@@ -1054,35 +1105,35 @@ class FishingBot:
                             self._yolo_last_collect_time = _now
                             _cdir = os.path.join(
                                 config.BASE_DIR, "yolo", "dataset",
-                                "images", "unlabeled"
-                            )
+                                "images", "unlabeled")
                             os.makedirs(_cdir, exist_ok=True)
                             _ts = time.strftime("%Y%m%d_%H%M%S")
                             _ms = int((_now % 1) * 1000)
                             cv2.imwrite(
                                 os.path.join(_cdir, f"{_ts}_{_ms:03d}.png"),
-                                screen
-                            )
+                                screen)
 
                 else:
+                    # ──── 模板匹配: 原有逻辑 ────
                     _fish_sr = search_region
                     if search_region:
                         _sr_x, _sr_y, _sr_w, _sr_h = search_region
                         _new_x, _new_w = _sr_x, _sr_w
                         _new_y, _new_h = _sr_y, _sr_h
-
                         if self._bar_locked_cx is not None:
-                            _nx = max(_sr_x, self._bar_locked_cx - _FISH_X_HALF)
-                            _nx2 = min(_sr_x + _sr_w, self._bar_locked_cx + _FISH_X_HALF)
+                            _nx = max(_sr_x,
+                                      self._bar_locked_cx - _FISH_X_HALF)
+                            _nx2 = min(_sr_x + _sr_w,
+                                       self._bar_locked_cx + _FISH_X_HALF)
                             if _nx2 - _nx > 10:
                                 _new_x, _new_w = _nx, _nx2 - _nx
-
                         if self._fish_smooth_cy is not None:
-                            _ny = max(_sr_y, int(self._fish_smooth_cy) - 150)
-                            _ny2 = min(_sr_y + _sr_h, int(self._fish_smooth_cy) + 150)
+                            _ny = max(_sr_y,
+                                      int(self._fish_smooth_cy) - 150)
+                            _ny2 = min(_sr_y + _sr_h,
+                                       int(self._fish_smooth_cy) + 150)
                             if _ny2 - _ny > 30:
                                 _new_y, _new_h = _ny, _ny2 - _ny
-
                         _fish_sr = (_new_x, _new_y, _new_w, _new_h)
 
                     _fg, _fox, _foy = self.detector.prepare_gray(
@@ -1117,16 +1168,19 @@ class FishingBot:
                             else:
                                 _n = len(config.FISH_KEYS)
                                 _grp_size = 2
-                                _grp_count = ((_n + _grp_size - 1) // _grp_size)
+                                _grp_count = ((_n + _grp_size - 1)
+                                              // _grp_size)
                                 _grp_idx = frame % _grp_count
                                 _start = _grp_idx * _grp_size
-                                _keys = config.FISH_KEYS[_start:_start + _grp_size]
+                                _keys = config.FISH_KEYS[
+                                    _start:_start + _grp_size]
                                 r = self.detector.find_fish(
                                     screen, config.THRESH_FISH, _fish_sr,
                                     pre_gray=_fg, pre_offset=(_fox, _foy),
                                     keys=_keys,
                                 )
-                            return (r, self.detector._last_best_key if r else None)
+                            return (r, self.detector._last_best_key
+                                    if r else None)
 
                     def _detect_bar():
                         _scales = locked_bar_scales or config.BAR_SCALES
@@ -1144,6 +1198,35 @@ class FishingBot:
 
                     fish, _matched_key = fish_result
                     bar, _bar_scale = bar_result
+                # ════════════ ★ 瞬时丢失保护 (保持最近5帧) ════════════
+                # 目标:
+                # - YOLO / 模板匹配偶发1~5帧漏检时，不立刻把 fish/bar 视为丢失
+                # - 用最近一次有效框暂时顶上，减少“看丢一下就整局崩”的情况
+
+                if fish is not None:
+                    _last_fish_box = fish
+                    _fish_hold_left = _HOLD_FRAMES
+                elif _last_fish_box is not None and _fish_hold_left > 0:
+                    fish = _last_fish_box
+                    _fish_hold_left -= 1
+                    if _fish_hold_left == _HOLD_FRAMES - 1:
+                        log.debug(f"[HOLD] fish 漏检，复用最近框 { _HOLD_FRAMES } 帧")
+                else:
+                    _last_fish_box = None
+                    _fish_hold_left = 0
+
+                if bar is not None:
+                    _last_bar_box = bar
+                    _bar_hold_left = _HOLD_FRAMES
+                elif _last_bar_box is not None and _bar_hold_left > 0:
+                    bar = _last_bar_box
+                    _bar_hold_left -= 1
+                    if _bar_hold_left == _HOLD_FRAMES - 1:
+                        log.debug(f"[HOLD] bar 漏检，复用最近框 { _HOLD_FRAMES } 帧")
+                else:
+                    _last_bar_box = None
+                    _bar_hold_left = 0
+
                 if not _use_yolo:
                     fish_detect_name = ""
                     if locked_fish_key:
@@ -1153,34 +1236,33 @@ class FishingBot:
                                 and fish_lost % 20 == 0):
                             locked_fish_key = None
                             locked_fish_scales = None
-                            log.info("  ★ 魚テンプレートのロックを解除し、再探索します")
+                            log.info("  ★ 解除鱼模板锁定, 重新搜索")
                     else:
                         if fish is not None:
                             fish_detect_name = _matched_key or "?"
-                            if (_matched_key and _matched_key != "fish_white"):
+                            if (_matched_key
+                                    and _matched_key != "fish_white"):
                                 locked_fish_key = _matched_key
                                 s = self.detector._last_best_scale
                                 locked_fish_scales = [
-                                    round(s * 0.85, 2), s, round(s * 1.15, 2)
+                                    round(s * 0.85, 2), s,
+                                    round(s * 1.15, 2)
                                 ]
                                 log.info(
-                                    f"  ★ 魚テンプレートをロック: "
+                                    f"  ★ 锁定鱼模板: "
                                     f"{locked_fish_key} @ scales="
                                     f"{[f'{x:.2f}' for x in locked_fish_scales]}"
                                 )
-
-                # ── 補完前の有効検出だけ履歴へ保存 ──
-                _push_recent(recent_fish, fish, frame)
-                _push_recent(recent_bar, bar, frame)
-                _push_recent(recent_progress, _yolo_progress, frame)
 
                 if fish is not None:
                     self._current_fish_name = fish_detect_name
                     if not _skip_fish and fish_detect_name:
                         wl_key = fish_detect_name
                         if not config.FISH_WHITELIST.get(wl_key, True):
-                            fname_cn = self.FISH_DISPLAY.get(wl_key, (wl_key,))[0]
-                            log.info(f"[ホワイトリスト] {fname_cn} は対象外のため、この釣りは放棄します")
+                            fname_cn = self.FISH_DISPLAY.get(
+                                wl_key, (wl_key,))[0]
+                            log.info(
+                                f"[白名单] {fname_cn} 不在白名单中, 放弃本次钓鱼")
                             _skip_fish = True
 
                 if not _use_yolo and bar is not None and not locked_bar_scales:
@@ -1190,39 +1272,34 @@ class FishingBot:
                         round(_bar_scale * 1.15, 2),
                     ]
                     log.info(
-                        f"  ★ 白バースケールをロック "
+                        f"  ★ 锁定白条 "
                         f"@ scales={[f'{x:.2f}' for x in locked_bar_scales]}"
                     )
 
-                # ════════════ X軸検証（魚と白バーは同一軌道Xを共有） ════════════
+                # ════════════ ★ X轴验证 (鱼和白条共用轨道X) ════════════
                 if bar is not None:
                     raw_bcx = bar[0] + bar[2] // 2
                     if self._bar_locked_cx is None:
                         self._bar_locked_cx = raw_bcx
-                        log.info(f"  ★ 軌道X軸をロック(白バー): X={raw_bcx}")
+                        log.info(f"  ★ 轨道X轴锁定(白条): X={raw_bcx}")
                     elif abs(raw_bcx - self._bar_locked_cx) > _BAR_X_HALF:
                         bar = None
-
                     if bar is not None:
-                        bar = (
-                            self._bar_locked_cx - bar[2] // 2,
-                            bar[1], bar[2], bar[3], bar[4]
-                        )
+                        bar = (self._bar_locked_cx - bar[2] // 2,
+                               bar[1], bar[2], bar[3], bar[4])
 
-                # ════════════ 初回白バー検出後に探索範囲をY軸固定 ════════════
+                # ════════════ ★ 首次检测到白条 → 锁定Y轴搜索范围 ════════════
                 if bar is not None and not _regions_locked:
                     bar_cy = bar[1] + bar[3] // 2
                     tcx = self._bar_locked_cx or (bar[0] + bar[2] // 2)
                     y_top = max(0, bar_cy - config.REGION_UP)
                     y_bot = min(h_scr, bar_cy + config.REGION_DOWN)
                     _roi = config.DETECT_ROI
-
                     if _roi:
                         y_top = max(y_top, _roi[1])
                         y_bot = min(y_bot, _roi[1] + _roi[3])
-
                     rh = y_bot - y_top
-
+                    # 鱼: 比白条稍宽的搜索区域
                     fish_half = max(config.REGION_X * 2, 80)
                     fsx = max(0, tcx - fish_half)
                     fsw = min(fish_half * 2, w_scr - fsx)
@@ -1230,7 +1307,7 @@ class FishingBot:
                         fsx = max(fsx, _roi[0])
                         fsw = min(fsw, _roi[0] + _roi[2] - fsx)
                     search_region = (fsx, y_top, fsw, rh)
-
+                    # 白条: 紧搜索区域 (用户控制)
                     bar_half = config.REGION_X
                     bsx = max(0, tcx - bar_half)
                     bsw = min(bar_half * 2, w_scr - bsx)
@@ -1238,44 +1315,42 @@ class FishingBot:
                         bsx = max(bsx, _roi[0])
                         bsw = min(bsw, _roi[0] + _roi[2] - bsx)
                     bar_search_region = (bsx, y_top, bsw, rh)
-
                     _regions_locked = True
                     log.info(
-                        f"  ★ 探索範囲をロック(白バーY={bar_cy}): "
+                        f"  ★ 搜索区域锁定(白条Y={bar_cy}): "
                         f"Y={y_top}~{y_bot} "
-                        f"魚X=±{fish_half} バーX=±{bar_half}"
-                        f"{' (ROI切り抜き)' if _roi else ''}"
+                        f"鱼X=±{fish_half} 条X=±{bar_half}"
+                        f"{' (ROI裁剪)' if _roi else ''}"
                     )
 
-                # 魚も同じ軌道Xに合わせる
+                # 鱼: 用同一个轨道X验证, 偏离过大则丢弃
                 if fish is not None:
                     raw_fcx = fish[0] + fish[2] // 2
                     if self._bar_locked_cx is not None:
                         if abs(raw_fcx - self._bar_locked_cx) > _FISH_X_HALF:
                             fish = None
                             self._current_fish_name = ""
-
                     if fish is not None and self._bar_locked_cx is not None:
-                        fish = (
-                            self._bar_locked_cx - fish[2] // 2,
-                            fish[1], fish[2], fish[3], fish[4]
-                        )
+                        fish = (self._bar_locked_cx - fish[2] // 2,
+                                fish[1], fish[2], fish[3], fish[4])
 
-                # ════════════ 空間妥当性チェック（Y軸のみ） ════════════
+                # ════════════ ★ 空间合理性验证 (仅Y轴) ════════════
                 if fish is not None and bar is not None:
                     fish_cy_check = fish[1] + fish[3] // 2
-                    bar_cy_check = bar[1] + bar[3] // 2
+                    bar_cy_check  = bar[1]  + bar[3]  // 2
                     dist_y = abs(fish_cy_check - bar_cy_check)
 
                     if dist_y > config.MAX_FISH_BAR_DIST:
                         if frame % 30 == 1:
                             log.warning(
-                                f"[⚠ 誤検出] 魚Y={fish_cy_check} バーY={bar_cy_check} "
-                                f"距離={dist_y}px > {config.MAX_FISH_BAR_DIST}px"
+                                f"[⚠ 误检] 鱼Y={fish_cy_check} 条Y="
+                                f"{bar_cy_check} 距离={dist_y}px > "
+                                f"{config.MAX_FISH_BAR_DIST}px"
                             )
                         fish = None
                         bar = None
 
+<<<<<<< HEAD
                 # ════════════ 直前5フレーム補完 ════════════
                 if fish is None:
                     fish = _get_recent(recent_fish, frame, max_age=5)
@@ -1298,64 +1373,54 @@ class FishingBot:
                     self._pd_last_bar_box = bar
 
                 # ════════════ デバッグ描画 ════════════
+=======
+                # ════════════ ★ 可视化调试 (每帧都画, 内置节流) ════════════
+                # ★ 用原始画面展示 (不旋转), 更直观
+                # (旋转时坐标略有偏差, 但远好过看旋转画面)
+>>>>>>> parent of baf4437 (Remake all system)
                 if not self._need_rotation:
                     self._show_debug_overlay(
                         screen_raw, fish, bar, search_region,
                         bar_search_region=bar_search_region,
                         progress=_yolo_progress,
-                        status_text=f"🐟 ミニゲーム F{frame:04d}"
+                        status_text=f"🐟 小游戏 F{frame:04d}"
                     )
                 else:
                     self._show_debug_overlay(
                         screen_raw,
                         bar_search_region=bar_search_region,
                         progress=_yolo_progress,
-                        status_text=f"🐟 ミニゲーム F{frame:04d} (回転{self._track_angle:.0f}°補正中)"
+                        status_text=f"🐟 小游戏 F{frame:04d} (旋转{self._track_angle:.0f}°补偿中)"
                     )
 
-                # ════════════ 進捗取得（終了判定には使うが、直接終了はしない） ════════════
+                # ════════════ 进度条 (记录进度, 不直接判定结束) ════════════
                 green = 0.0
-
                 if frame <= _PROGRESS_SKIP_FRAMES:
                     pass
-
                 elif _use_yolo and _yolo_progress is not None:
-                    green = self.yolo.detect_progress_fill_ratio(
-                        screen, _yolo_progress
-                    )
-
+                    px, py, pw, ph = _yolo_progress[:4]
+                    pcx = px + pw // 2
+                    strip_w = 5
+                    sx = max(0, pcx - strip_w // 2)
+                    green = self.detector.detect_green_ratio(
+                        screen, (sx, py, strip_w, ph))
                     if not self._progress_debug_saved and green > 0:
                         self._progress_debug_saved = True
-
-                        px, py, pw, ph = _yolo_progress[:4]
                         _pad = 20
                         _dx = max(0, px - _pad)
-                        _dy = max(0, py)
                         _dw = min(pw + _pad * 2, w_scr - _dx)
-                        _dh = min(ph, h_scr - _dy)
-
-                        if _dw > 0 and _dh > 0:
-                            _dbg = screen[_dy:_dy + _dh, _dx:_dx + _dw].copy()
-                            cv2.rectangle(
-                                _dbg,
-                                (px - _dx, 0),
-                                (px - _dx + pw, ph),
-                                (0, 255, 0),
-                                1
-                            )
-                            _info = f"green={green:.0%}"
-                            cv2.putText(
-                                _dbg, _info, (2, 16),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                                (0, 255, 255), 1
-                            )
-                            _ddir = os.path.join(config.BASE_DIR, "debug")
-                            os.makedirs(_ddir, exist_ok=True)
-                            cv2.imwrite(
-                                os.path.join(_ddir, "progress_strip.png"),
-                                _dbg
-                            )
-
+                        _dbg = screen[py:py + ph, _dx:_dx + _dw].copy()
+                        cv2.rectangle(_dbg, (sx - _dx, 0),
+                                      (sx - _dx + strip_w, ph),
+                                      (0, 255, 0), 1)
+                        _info = f"green={green:.0%} w={strip_w}"
+                        cv2.putText(_dbg, _info, (2, 16),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                    (0, 255, 255), 1)
+                        _ddir = os.path.join(config.BASE_DIR, "debug")
+                        os.makedirs(_ddir, exist_ok=True)
+                        cv2.imwrite(
+                            os.path.join(_ddir, "progress_strip.png"), _dbg)
                 else:
                     _sr_for_progress = search_region
                     if bar is not None:
@@ -1365,66 +1430,69 @@ class FishingBot:
                         _pr_x = max(0, bcx - _pr_half_x)
                         _pr_y = max(0, bcy - config.REGION_UP)
                         _pr_w = min(_pr_half_x * 2, w_scr - _pr_x)
-                        _pr_h = min(config.REGION_UP + config.REGION_DOWN, h_scr - _pr_y)
+                        _pr_h = min(config.REGION_UP + config.REGION_DOWN,
+                                    h_scr - _pr_y)
                         _sr_for_progress = (_pr_x, _pr_y, _pr_w, _pr_h)
                         _last_progress_sr = _sr_for_progress
                     elif _last_progress_sr is not None:
                         _sr_for_progress = _last_progress_sr
+                    green = self._check_progress(
+                        screen, fish, _sr_for_progress)
 
-                    green = self._check_progress(screen, fish, _sr_for_progress)
-
-                # ★ 急落だけ平滑化（急上昇は成功の可能性があるので潰さない）
-                if green < _prev_green and (_prev_green - green) > 0.30:
-                    log.debug(
-                        f"  進捗が急落 {_prev_green:.0%}→{green:.0%} のため平滑化します"
-                    )
-                    green = _prev_green * 0.7 + green * 0.3
+                if green > 0 and _prev_green > 0.01 and (green - _prev_green) > 0.30:
+                    log.debug(f"  进度跳变过大 {_prev_green:.0%}→{green:.0%}，忽略")
+                    green = _prev_green
 
                 if green > 0:
                     _prev_green = green
                 if green > _last_green:
                     _last_green = green
+<<<<<<< HEAD
 
                 self._pd_last_progress = _last_green
 
                 # ════════════ ミニゲーム終了判定 ════════════
                 obj_count = ((fish is not None) + (bar is not None) + (1 if track_alive else 0))
+=======
+>>>>>>> parent of baf4437 (Remake all system)
 
-                # 1) 魚+バー両方未検出
+                # ════════════ 游戏结束检测 ════════════
+                # ★ 统计本帧检测到的对象数量 (鱼/白条/轨道)
+                obj_count = ((fish is not None) + (bar is not None)
+                             + (1 if track_alive else 0))
+
+                # 1) 鱼+条都没检测到 → 计数
                 if fish is None and bar is None:
                     no_detect += 1
-
                     if no_detect > 5 and not config.IL_RECORD:
                         self.input.mouse_up()
 
                     if no_detect == 10:
-                        log.warning(f"[⚠ ロスト] {no_detect}フレーム連続で魚+バーを検出できません")
+                        log.warning(
+                            f"[⚠ 丢失] 连续{no_detect}帧鱼+条均未检测到"
+                        )
                         self.screen.save_debug(screen, "minigame_lost")
 
                     if no_detect > config.TRACK_LOST_LIMIT:
-                        log.info(f"[📋 終了] {no_detect}フレーム連続で有効UIを検出できなかったため終了します")
-                        end_reason = "track_lost_limit"
+                        log.info(f"[📋 结束] 连续{no_detect}帧未检测到有效UI，游戏已结束")
                         break
 
                     time.sleep(config.GAME_LOOP_INTERVAL)
                     continue
                 else:
                     if no_detect > 5:
-                        log.info(f"[✓ 復帰] 有効UIを再検出しました（直前は {no_detect} フレームロスト）")
+                        log.info(f"[✓ 恢复] 重新检测到有效UI (之前丢失{no_detect}帧)")
                     no_detect = 0
 
-                # 2) 魚だけ個別に追跡
+                # 2) 单独追踪鱼的消失 (条可能误匹配)
                 if fish is None:
                     fish_lost += 1
                     if fish_gone_since is None:
                         fish_gone_since = time.time()
-
                     if fish_lost == 30:
-                        log.warning(f"[⚠ 魚ロスト] {fish_lost}フレーム連続で魚を検出できません")
-
+                        log.warning(f"[⚠ 鱼丢失] 连续{fish_lost}帧未检测到鱼")
                     if had_good_detection and fish_lost > config.FISH_LOST_LIMIT:
-                        log.info(f"[📋 終了] 魚を {fish_lost} フレーム見失ったため、ゲーム終了とみなします")
-                        end_reason = "fish_lost_limit"
+                        log.info(f"[📋 结束] 鱼已消失{fish_lost}帧，游戏可能已结束")
                         break
                 else:
                     fish_lost = 0
@@ -1437,111 +1505,135 @@ class FishingBot:
                 else:
                     bar_gone_since = None
 
-                # 3) 単体ロスト時間超過
+                # ★ 单项超时: 鱼或条任一消失超过 N 秒 → 失败收杆
                 _timeout = config.SINGLE_OBJ_TIMEOUT
                 now_t = time.time()
-
                 if (had_good_detection and fish_gone_since is not None
                         and now_t - fish_gone_since > _timeout):
                     elapsed = now_t - fish_gone_since
                     log.info(
-                        f"[📋 失敗] 魚が {elapsed:.1f}s 連続で消失しました "
-                        f"(>{_timeout}s)。ミニゲーム終了"
+                        f"[📋 失败] 鱼连续消失 {elapsed:.1f}s "
+                        f"(>{_timeout}s), 游戏结束"
                     )
-                    end_reason = "fish_gone_timeout"
                     break
-
                 if (had_good_detection and bar_gone_since is not None
                         and now_t - bar_gone_since > _timeout):
                     elapsed = now_t - bar_gone_since
                     log.info(
-                        f"[📋 失敗] 白バーが {elapsed:.1f}s 連続で消失しました "
-                        f"(>{_timeout}s)。ミニゲーム終了"
+                        f"[📋 失败] 白条连续消失 {elapsed:.1f}s "
+                        f"(>{_timeout}s), 游戏结束"
                     )
-                    end_reason = "bar_gone_timeout"
                     break
 
-                # 4) 検出対象不足（魚 / バー / 軌道 のうち最低2つ必要）
+                # 3) ★ 对象不足检测: 鱼/条/轨道 至少2个才继续
                 if obj_count < config.OBJ_MIN_COUNT:
                     obj_gone_count += 1
                     if obj_gone_count == 1 or obj_gone_count % 10 == 0:
-                        has_f = "魚✓" if fish is not None else "魚✗"
-                        has_b = "バー✓" if bar is not None else "バー✗"
-                        has_t = "軌道✓" if track_alive else "軌道✗"
+                        has_f = "鱼✓" if fish is not None else "鱼✗"
+                        has_b = "条✓" if bar is not None else "条✗"
+                        has_t = "轨道✓" if track_alive else "轨道✗"
                         log.warning(
-                            f"[⚠ 対象不足] {has_f} {has_b} {has_t} "
-                            f"= {obj_count}個 "
+                            f"[⚠ 对象不足] {has_f} {has_b} {has_t} "
+                            f"= {obj_count}个 "
                             f"({obj_gone_count}/{config.OBJ_GONE_LIMIT})"
                         )
-
                     if obj_gone_count >= config.OBJ_GONE_LIMIT:
                         log.info(
-                            f"[📋 終了] {obj_gone_count}フレーム連続で "
-                            f"検出対象が {obj_count} 個しかなかったため終了します"
+                            f"[📋 结束] 连续{obj_gone_count}帧仅检测到"
+                            f"{obj_count}个对象，游戏结束!"
                         )
-                        end_reason = "obj_gone_limit"
                         break
                 else:
                     if obj_gone_count > 3:
                         log.info(
-                            f"[✓ 復帰] 検出対象数が {obj_count} に回復しました "
-                            f"(直前は {obj_gone_count} フレーム不足)"
+                            f"[✓ 恢复] 对象数恢复为{obj_count}"
+                            f" (之前不足{obj_gone_count}帧)"
                         )
                     obj_gone_count = 0
 
-                # ════════════ 制御（録画 / モデル / PD） ════════════
+                # ════════════ ★ 控制 (录制 / 模型 / PD) ════════════
+                self._update_bar_velocity(bar)
+
                 if _skip_fish:
                     self.input.mouse_up()
                     held = False
                 elif config.IL_RECORD:
                     self._il_record_frame(frame, fish, bar)
                     held = False
+                elif getattr(config, "USE_ADAPTIVE_PD", False):
+                    held = self._adaptive_pd_control(fish, bar)
+                elif config.IL_USE_HYBRID and self._il_policy is not None:
+                    held = self._hybrid_model_control(fish, bar, search_region)
                 elif config.IL_USE_MODEL and self._il_policy is not None:
                     held = self._il_model_control(fish, bar)
                 else:
                     held = self._control_mouse(fish, bar, search_region)
 
-                if held:
-                    hold_count += 1
-
-                # 5秒後にユーザー設定の debug mode に戻す
+                # 5秒后切回用户设置的调试模式
                 if frame == 50:
                     self.detector.debug_report = self.debug_mode
 
-                # ── 30フレームごとにログ ──
+                # ── 日志 (每30帧输出) ──
                 if frame % 30 == 0:
-                    fname = self._current_fish_name.replace("fish_", "") \
-                        if self._current_fish_name else ""
-                    fi = f"魚[{fname}]Y={fish[1]+fish[3]//2}" if fish else "魚=なし"
-                    bi = f"バーY={bar[1]+bar[3]//2}" if bar else "バー=なし"
+                    fname = self._current_fish_name.replace(
+                        "fish_", ""
+                    ) if self._current_fish_name else ""
+                    fi = (f"鱼[{fname}]Y={fish[1]+fish[3]//2}"
+                          if fish else "鱼=无")
+                    bi = f"条Y={bar[1]+bar[3]//2}" if bar else "条=无"
                     vel = f"v={self._bar_velocity:+.0f}"
                     log.info(
                         f"[F{frame:04d}] {fi} | {bi} | {vel} | "
-                        f"押下:{hold_count} | 進捗:{green:.0%}"
+                        f"按住:{hold_count} | 进度:{green:.0%}"
+                    )
+                
+                if (
+                    config.PD_RECORD
+                    and not config.IL_RECORD
+                    and not getattr(config, "USE_ADAPTIVE_PD", False)
+                    and not config.IL_USE_HYBRID
+                    and not config.IL_USE_MODEL
+                    and fish is not None
+                    and bar is not None
+                ):
+                    self._pd_record_frame(
+                        frame_idx=frame,
+                        fish=fish,
+                        bar=bar,
+                        pd_press=self._pd_last_press,
+                        pd_hold=self._pd_last_hold_decision,
+                        green=green,
                     )
 
                 time.sleep(config.GAME_LOOP_INTERVAL)
 
         finally:
-            log.info(f"[END_REASON] {end_reason}")
+            if (
+                config.PD_RECORD
+                and not config.IL_RECORD
+                and not getattr(config, "USE_ADAPTIVE_PD", False)
+                and not config.IL_USE_HYBRID
+                and not config.IL_USE_MODEL
+            ):
+                self._pd_stop_recording()
 
             if _skip_fish:
                 success = False
                 log.info(
-                    f"[⏭ スキップ] 対象外の魚のため放棄しました "
-                    f"(進捗 {_last_green:.0%} は無効)"
+                    f"[⏭ 跳过] 非目标鱼, 已放弃 (进度 {_last_green:.0%} 不计)"
                 )
             elif _last_green > config.SUCCESS_PROGRESS:
                 success = True
                 log.info(
-                    f"[✅ 成功] 最終進捗 {_last_green:.0%} > "
-                    f"{config.SUCCESS_PROGRESS:.0%} のため成功判定"
+                    f"[✅ 成功] 最终进度 {_last_green:.0%} > "
+                    f"{config.SUCCESS_PROGRESS:.0%}，判定成功"
                 )
             else:
                 log.info(
-                    f"[❌ 失敗] 最終進捗 {_last_green:.0%} <= "
-                    f"{config.SUCCESS_PROGRESS:.0%} のため失敗判定"
+                    f"[❌ 失败] 最终进度 {_last_green:.0%} <= "
+                    f"{config.SUCCESS_PROGRESS:.0%}，判定失败"
                 )
+            
 
             if config.PD_RECORD and (not config.IL_RECORD) and (not config.IL_USE_MODEL):
                 try:
@@ -1560,38 +1652,35 @@ class FishingBot:
 
             if config.IL_RECORD:
                 self._il_stop_recording()
-                log.info("[🎣 収竿] 録画モードのため手動で収竿してください")
+                log.info("[🎣 收杆] 录制模式 — 请手动收杆")
             else:
                 self.input.safe_release()
-                time.sleep(config.POST_RELEASE_DELAY)
-
+                # 安全间隔: 防止 PD 控制器最后一次 mouse_down 在游戏结束
+                # 瞬间变成意外点击（导致误下饵）
+                time.sleep(0.3)
                 if success:
-                    time.sleep(config.SUCCESS_CLICK_DELAY)
+                    time.sleep(0.5)
                     self.input.click()
-                    log.info(
-                        f"[🎣 収竿] 釣り成功。"
-                        f"{config.SUCCESS_CLICK_DELAY:.2f}s 後にクリックして収竿しました"
-                    )
+                    log.info("[🎣 收杆] 钓鱼成功, 点击收杆")
                 else:
-                    log.info("[🎣 失敗] 竿は自動で戻っているため、収竿クリックは行いません")
-
+                    log.info("[🎣 失败] 鱼竿已自动收回, 跳过收杆")
+                    # YOLO 仅在失败时采集图像（无需勾选"采集数据"，独立开关）
                     if config.YOLO_COLLECT_ON_FAIL:
                         try:
                             _cdir = os.path.join(
                                 config.BASE_DIR, "yolo", "dataset",
-                                "images", "unlabeled"
-                            )
+                                "images", "unlabeled")
                             os.makedirs(_cdir, exist_ok=True)
                             _ts = time.strftime("%Y%m%d_%H%M%S")
                             _ms = int((time.time() % 1) * 1000)
+                            # 保存失败时的屏幕截图
                             _fail_screen = self._grab()
                             cv2.imwrite(
                                 os.path.join(_cdir, f"fail_{_ts}_{_ms:03d}.png"),
-                                _fail_screen
-                            )
-                            log.info(f"[YOLO] 失敗時画像を保存しました: fail_{_ts}_{_ms:03d}.png")
+                                _fail_screen)
+                            log.info(f"[YOLO] 已保存失败图像 fail_{_ts}_{_ms:03d}.png")
                         except Exception as e:
-                            log.warning(f"[YOLO] 失敗時画像の保存中に例外: {e}")
+                            log.warning(f"[YOLO] 保存失败图像异常: {e}")
 
         return success
 
@@ -1684,7 +1773,7 @@ class FishingBot:
             cv2.putText(debug, label, (8, y_txt),
                         cv2.FONT_HERSHEY_SIMPLEX, fs, lcolor, 1)
             y_txt += 20
-        elif fish is None and bar is None and self.state == "ミニゲーム中":
+        elif fish is None and bar is None and self.state == "小游戏进行中":
             cv2.putText(debug, "X no fish+bar", (8, y_txt),
                         cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 255), 1)
             y_txt += 20
@@ -1988,6 +2077,94 @@ class FishingBot:
         self._il_history.clear()
         log.info(f"[IL] 录制开始 → {path}")
 
+    def _pd_start_recording(self):
+        os.makedirs(config.PD_DATA_DIR, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(config.PD_DATA_DIR, f"pd_session_{ts}.csv")
+        self._pd_file = open(path, "w", newline="", encoding="utf-8")
+        self._pd_writer = csv.writer(self._pd_file)
+        self._pd_writer.writerow([
+            "frame", "timestamp",
+            "fish_cy", "bar_cy", "bar_h",
+            "error", "velocity", "fish_delta", "dist_ratio",
+            "mouse_prev",
+            "fish_in_bar", "press_streak",
+            "predicted", "bar_accel",
+            "pd_press", "pd_hold",
+            "green"
+        ])
+        self._pd_prev_fish_cy = None
+        self._pd_prev_velocity = 0.0
+        self._pd_log_counter = 0
+        log.info(f"[PD-REC] 录制开始 → {path}")
+
+    def _pd_stop_recording(self):
+        if self._pd_file:
+            self._pd_file.close()
+            self._pd_file = None
+            self._pd_writer = None
+            log.info("[PD-REC] 录制结束")
+
+    def _pd_build_features(self, fish, bar):
+        fish_cy = fish[1] + fish[3] // 2
+        bar_cy = bar[1] + bar[3] // 2
+        bar_h = max(bar[3], 1)
+        bar_top = bar[1]
+
+        error = float(bar_cy - fish_cy)
+        velocity = float(self._bar_velocity)
+
+        fish_delta = 0.0
+        if self._pd_prev_fish_cy is not None:
+            fish_delta = float(fish_cy - self._pd_prev_fish_cy)
+        self._pd_prev_fish_cy = fish_cy
+
+        dist_ratio = float(error / bar_h)
+        fish_in_bar = float((fish_cy - bar_top) / bar_h)
+
+        if self._prev_mouse_pressed >= 0.5:
+            self._press_streak = max(1, self._press_streak + 1)
+        else:
+            self._press_streak = min(-1, self._press_streak - 1)
+        press_streak = float(self._press_streak / 10.0)
+
+        predicted = float(error + velocity * 0.15)
+        bar_accel = float(velocity - self._pd_prev_velocity)
+        self._pd_prev_velocity = velocity
+
+        return {
+            "fish_cy": fish_cy,
+            "bar_cy": bar_cy,
+            "bar_h": bar_h,
+            "error": error,
+            "velocity": velocity,
+            "fish_delta": fish_delta,
+            "dist_ratio": dist_ratio,
+            "mouse_prev": float(self._prev_mouse_pressed),
+            "fish_in_bar": fish_in_bar,
+            "press_streak": press_streak,
+            "predicted": predicted,
+            "bar_accel": bar_accel,
+        }
+        
+    def _pd_record_frame(self, frame_idx, fish, bar, pd_press, pd_hold, green):
+        if fish is None or bar is None or self._pd_writer is None:
+            return
+
+        feats = self._pd_build_features(fish, bar)
+
+        self._pd_writer.writerow([
+            frame_idx, f"{time.time():.4f}",
+            feats["fish_cy"], feats["bar_cy"], feats["bar_h"],
+            f'{feats["error"]:.1f}', f'{feats["velocity"]:.1f}',
+            f'{feats["fish_delta"]:.1f}', f'{feats["dist_ratio"]:.3f}',
+            f'{feats["mouse_prev"]:.1f}',
+            f'{feats["fish_in_bar"]:.3f}', f'{feats["press_streak"]:.2f}',
+            f'{feats["predicted"]:.1f}', f'{feats["bar_accel"]:.1f}',
+            int(pd_press), f"{pd_hold:.4f}",
+            f"{green:.4f}",
+        ])
+
     def _il_stop_recording(self):
         """结束录制"""
         if self._il_file:
@@ -2125,6 +2302,244 @@ class FishingBot:
             self._il_log_counter += 1
             return False
 
+
+    def _hybrid_model_control(self, fish, bar, sr) -> bool:
+        """
+        PD制御をベースにしつつ、迷う場面だけ imitation で補助する。
+        戻り値: 最終的に「押した」なら True
+        """
+        # policy が無いなら普通に PD へ
+        if self._il_policy is None or not config.IL_USE_HYBRID:
+            return self._control_mouse(fish, bar, sr)
+
+        # fish/bar 両方見えてない時は PD に任せる
+        if fish is None or bar is None:
+            return self._control_mouse(fish, bar, sr)
+
+        # --------------------------------------------------
+        # まず既存PDと同じ材料を計算
+        # --------------------------------------------------
+        fish_cy = fish[1] + fish[3] // 2
+        bar_cy  = bar[1] + bar[3] // 2
+        bar_h   = max(bar[3], 1)
+        bar_top = bar[1]
+
+        error = bar_cy - fish_cy
+        velocity = self._bar_velocity
+
+        fish_delta = 0.0
+        if self._il_prev_fish_cy is not None:
+            fish_delta = fish_cy - self._il_prev_fish_cy
+        self._il_prev_fish_cy = fish_cy
+
+        dist_ratio = error / max(bar_h, 1)
+        fish_in_bar = (fish_cy - bar_top) / max(bar_h, 1)
+
+        # press streak
+        if self._prev_mouse_pressed >= 0.5:
+            self._press_streak = max(1, self._press_streak + 1)
+        else:
+            self._press_streak = min(-1, self._press_streak - 1)
+        press_streak = self._press_streak / 10.0
+
+        predicted = error + velocity * 0.15
+
+        bar_accel = 0.0
+        if hasattr(self, '_il_prev_velocity'):
+            bar_accel = velocity - self._il_prev_velocity
+        self._il_prev_velocity = velocity
+
+        # --------------------------------------------------
+        # imitation 側に特徴を投入
+        # --------------------------------------------------
+        self.hybrid_policy.update_features(
+            error=float(error),
+            velocity=float(velocity),
+            bar_h=float(bar_h),
+            fish_delta=float(fish_delta),
+            dist_ratio=float(dist_ratio),
+            mouse_prev=float(self._prev_mouse_pressed),
+            fish_in_bar=float(fish_in_bar),
+            press_streak=float(press_streak),
+            predicted=float(predicted),
+            bar_accel=float(bar_accel),
+        )
+
+        # --------------------------------------------------
+        # 既存PDの判定を「短い hold / release」に変換
+        # ここでは _control_mouse を丸ごと呼ばず、
+        # 同じ計算式で最終 press/release だけ決める
+        # --------------------------------------------------
+        # --------------------------------------------------
+        # 既存PD hold を計算
+        # --------------------------------------------------
+        TARGET_FIB = 0.5
+        KP         = getattr(config, 'HOLD_GAIN', 0.040)
+        KD         = getattr(config, 'SPEED_DAMPING', 0.00025)
+        BASE_HOLD  = getattr(config, 'HOLD_MIN_S', 0.025)
+        MAX_HOLD   = getattr(config, 'HOLD_MAX_S', 0.100)
+        MIN_HOLD   = 0.004
+
+        error_fib = TARGET_FIB - fish_in_bar
+        error_clamp = max(-2.0, min(2.0, error_fib))
+
+        # まずPDだけの hold
+        pd_hold = BASE_HOLD + error_clamp * KP + velocity * KD
+        pd_hold = max(MIN_HOLD, min(pd_hold, MAX_HOLD))
+
+        pd_press = pd_hold >= MIN_HOLD + 0.001
+
+        # --------------------------------------------------
+        # hybrid 判定
+        # --------------------------------------------------
+        hybrid = self.hybrid_policy.decide(
+            pd_press=bool(pd_press),
+            dist_ratio=float(dist_ratio),
+            error_px=float(error),
+        )
+
+        # --------------------------------------------------
+        # residual hold correction
+        # press/releaseの二値overrideではなく、
+        # モデル確率で hold を微調整する
+        # --------------------------------------------------
+        assist_prob = hybrid.probability
+
+        # -0.01 ~ +0.01 秒くらいの微調整から始める
+        delta_hold = (assist_prob - 0.5) * 0.02
+
+        # 高速時だけ補正を少し強める
+        speed_factor = min(1.0, abs(velocity) / 250.0)
+        delta_hold *= (0.35 + 0.65 * speed_factor)
+
+        hold = pd_hold + delta_hold
+        hold = max(MIN_HOLD, min(hold, MAX_HOLD))
+
+        final_press = hold >= MIN_HOLD + 0.001
+
+        # --------------------------------------------------
+        # 最終入力
+        # --------------------------------------------------
+        fname = (self._current_fish_name.replace("fish_", "")
+                if self._current_fish_name else "?")
+
+        if final_press:
+            self.input.mouse_down()
+            time.sleep(hold)
+            self.input.mouse_up()
+            self._prev_mouse_pressed = 1.0
+            self._last_hold = hold
+            self._last_fish_cy = fish_cy
+
+            if self._il_log_counter % 10 == 0:
+                log.info(
+                    f"  [HYB] [{fname}] fib={fish_in_bar:.2f} "
+                    f"v={velocity:+.0f} p={hybrid.probability:.2f} "
+                    f"mode={hybrid.mode} -> 按 {hold*1000:.0f}ms"
+                )
+            self._il_log_counter += 1
+            return True
+        else:
+            self.input.mouse_up()
+            self._prev_mouse_pressed = 0.0
+            self._last_hold = hold
+            self._last_fish_cy = fish_cy
+
+            if self._il_log_counter % 10 == 0:
+                log.info(
+                    f"  [HYB] [{fname}] fib={fish_in_bar:.2f} "
+                    f"v={velocity:+.0f} p={hybrid.probability:.2f} "
+                    f"mode={hybrid.mode} -> 释放"
+                )
+            self._il_log_counter += 1
+            return False
+
+    def _update_adaptive_pd_features(self, fish, bar):
+        if fish is None or bar is None:
+            return
+
+        fish_cy = fish[1] + fish[3] // 2
+        bar_cy = bar[1] + bar[3] // 2
+        bar_h = max(bar[3], 1)
+        bar_top = bar[1]
+
+        error = float(bar_cy - fish_cy)
+        velocity = float(self._bar_velocity)
+
+        fish_delta = 0.0
+        if self._last_fish_cy is not None:
+            fish_delta = float(fish_cy - self._last_fish_cy)
+
+        dist_ratio = float(error / bar_h)
+        fish_in_bar = float((fish_cy - bar_top) / bar_h)
+
+        if self._prev_mouse_pressed >= 0.5:
+            self._press_streak = max(1, self._press_streak + 1)
+        else:
+            self._press_streak = min(-1, self._press_streak - 1)
+        press_streak = float(self._press_streak / 10.0)
+
+        predicted = float(error + velocity * 0.15)
+        bar_accel = float(velocity - self._adaptive_prev_velocity)
+
+        self.adaptive_pd.update_features(
+            error=error,
+            velocity=velocity,
+            bar_h=float(bar_h),
+            fish_delta=fish_delta,
+            dist_ratio=dist_ratio,
+            mouse_prev=float(self._prev_mouse_pressed),
+            fish_in_bar=fish_in_bar,
+            press_streak=press_streak,
+            predicted=predicted,
+            bar_accel=bar_accel,
+        )
+
+        self._adaptive_prev_velocity = velocity
+    def _adaptive_pd_control(self, fish, bar) -> bool:
+        if fish is None or bar is None:
+            self.input.mouse_up()
+            self._prev_mouse_pressed = 0.0
+            self._press_streak = 0
+            return False
+
+        fish_cy = fish[1] + fish[3] // 2
+
+        self._update_adaptive_pd_features(fish, bar)
+        decision = self.adaptive_pd.decide()
+
+        hold = max(config.HOLD_MIN_S, min(float(decision.hold), config.HOLD_MAX_S))
+        press = bool(decision.press)
+
+        if press:
+            self.input.mouse_down()
+            time.sleep(hold)
+            self.input.mouse_up()
+            self._prev_mouse_pressed = 1.0
+            self._last_hold = hold
+            self._last_fish_cy = fish_cy
+            return True
+        else:
+            self.input.mouse_up()
+            self._prev_mouse_pressed = 0.0
+            self._last_hold = 0.0
+            self._last_fish_cy = fish_cy
+            return False
+
+    def _update_bar_velocity(self, bar):
+        """白条速度推定。bar が見えているフレームでは毎回更新する。"""
+        now = time.time()
+        if bar is not None:
+            bar_cy_raw = bar[1] + bar[3] // 2
+            if self._bar_prev_cy is not None and self._bar_prev_time is not None:
+                dt = now - self._bar_prev_time
+                if dt > 0.003:
+                    raw_vel = (bar_cy_raw - self._bar_prev_cy) / dt
+                    a = min(config.VELOCITY_SMOOTH, 0.95)
+                    self._bar_velocity = a * self._bar_velocity + (1 - a) * raw_vel
+            self._bar_prev_cy = bar_cy_raw
+            self._bar_prev_time = now
+        
     def _control_mouse(self, fish, bar, sr) -> bool:
         """
         PD 物理控制器（星露谷钓鱼）:
@@ -2142,9 +2557,9 @@ class FishingBot:
 
         返回: 是否执行了按住操作
         """
-        now = time.time()
 
         # ═══════════ ★ 速度估算: 只要检测到白条就更新 ═══════════
+<<<<<<< HEAD
         if bar is not None:
             bar_cy_raw = bar[1] + bar[3] // 2
             if (self._bar_prev_cy is not None
@@ -2158,6 +2573,8 @@ class FishingBot:
                     )
             self._bar_prev_cy = bar_cy_raw
             self._bar_prev_time = now
+=======
+>>>>>>> parent of baf4437 (Remake all system)
 
         vel = self._bar_velocity
 
@@ -2231,7 +2648,13 @@ class FishingBot:
             fname = (self._current_fish_name.replace("fish_", "")
                      if self._current_fish_name else "?")
 
+<<<<<<< HEAD
             if action_press:
+=======
+            if hold >= MIN_HOLD + 0.001:
+                self._pd_last_press = True
+                self._pd_last_hold_decision = hold
+>>>>>>> parent of baf4437 (Remake all system)
                 self.input.mouse_down()
                 time.sleep(hold)
                 self.input.mouse_up()
@@ -2241,6 +2664,8 @@ class FishingBot:
                 )
                 return True
             else:
+                self._pd_last_press = False
+                self._pd_last_hold_decision = 0.0
                 self.input.mouse_up()
                 log.info(
                     f"  ○ [{fname}] fib={fish_in_bar:.2f} "
@@ -2271,10 +2696,15 @@ class FishingBot:
 
             if fish_cy < mid_y:
                 h = min(fallback * 1.5, MAX_HOLD)
+<<<<<<< HEAD
                 action_press = 1
                 control_value = float(h)
                 in_deadzone = False
 
+=======
+                self._pd_last_press = True
+                self._pd_last_hold_decision = h
+>>>>>>> parent of baf4437 (Remake all system)
                 self.input.mouse_down()
                 time.sleep(h)
                 self.input.mouse_up()
@@ -2285,9 +2715,14 @@ class FishingBot:
                 )
                 return True
             else:
+<<<<<<< HEAD
                 action_press = 0
                 control_value = 0.0
                 in_deadzone = False
+=======
+                self._pd_last_press = False
+                self._pd_last_hold_decision = 0.0
+>>>>>>> parent of baf4437 (Remake all system)
                 self.input.mouse_up()
                 return False
 
@@ -2315,8 +2750,12 @@ class FishingBot:
                 f"  (仅条) Y={bar_cy} v={vel:+.0f}"
                 f" → 按 {hold*1000:.0f}ms"
             )
+            self._pd_last_press = True
+            self._pd_last_hold_decision = hold
             return True
 
+        self._pd_last_press = False
+        self._pd_last_hold_decision = 0.0
         return False
 
     # ══════════════════════════════════════════════════════

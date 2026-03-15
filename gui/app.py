@@ -19,58 +19,61 @@ import config
 from core.bot import FishingBot
 from utils.logger import log
 from utils import i18n
-
+import traceback
 
 class FishingApp:
     """VRChat 自动钓鱼 — 主窗口"""
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        
-        # ── 初始化语言 ──
-        self._current_lang = getattr(config, 'LANGUAGE', 'zh')
+
+        # ── 設定ファイルから言語だけ先読み ──
+        self._current_lang = self._preload_language()
+        config.LANGUAGE = self._current_lang
         i18n.set_language(self._current_lang)
-        
+
         self.root.title(i18n._("app_title"))
         self.root.geometry("580x820")
         self.root.resizable(True, True)
         self.root.minsize(520, 650)
-        # ★ 默认不置顶 (用户可通过复选框开启)
         self.root.attributes("-topmost", False)
 
-        # ── 机器人实例 ──
         self.bot = FishingBot()
         self.bot_thread: threading.Thread | None = None
+        self._param_vars = {}
+        self._train_thread: threading.Thread | None = None
+        self._train_queue: queue.Queue = queue.Queue()
+        self._training_now = False
 
-        # ── 参数变量 ──
-        self._param_vars = {}        # config属性名 → tk.StringVar
-
-        # ── 构建界面 ──
         self._build_ui()
-
-        # ── 加载上次保存的参数 ──
         self._load_settings()
 
-        # ── 预加载 YOLO ──
         if self.bot.yolo is None:
             self._preload_yolo()
 
-        # ── 注册全局快捷键 ──
         keyboard.add_hotkey(config.HOTKEY_TOGGLE, self._toggle_from_hotkey)
         keyboard.add_hotkey(config.HOTKEY_STOP,   self._stop_from_hotkey)
-        keyboard.add_hotkey(config.HOTKEY_DEBUG,   self._toggle_debug_from_hotkey)
+        keyboard.add_hotkey(config.HOTKEY_DEBUG,  self._toggle_debug_from_hotkey)
 
-        # ── 启动轮询 ──
         self._poll()
-
-        # ── 关闭处理 ──
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
         self._log_msg(i18n._("msg_github"))
 
     # ══════════════════════════════════════════════════════
     #  界面构建
     # ══════════════════════════════════════════════════════
+    def _preload_language(self) -> str:
+        """UI構築前に settings.json から言語だけ先読みする"""
+        try:
+            if os.path.exists(config.SETTINGS_FILE):
+                with open(config.SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                lang = data.get("LANGUAGE", getattr(config, "LANGUAGE", "zh"))
+                if lang in ("zh", "en", "jp"):
+                    return lang
+        except Exception:
+            pass
+        return getattr(config, "LANGUAGE", "zh")
 
     def _build_ui(self):
         pad = {"padx": 10, "pady": 5}
@@ -250,6 +253,43 @@ class FishingApp:
         self.lbl_roi.pack(side="left")
 
         # (行为克隆 UI 已移除)
+
+        # ── Adaptive PD 学习区 ──
+        self.frm_train = ttk.LabelFrame(self.root, text="Adaptive PD")
+        self.frm_train.pack(fill="x", **pad)
+
+        self.btn_auto_train = ttk.Button(
+            self.frm_train,
+            text="Auto Train PD",
+            command=self._on_auto_train,
+            width=16,
+        )
+        self.btn_auto_train.pack(side="left", padx=5, pady=5)
+
+        ttk.Label(self.frm_train, text="epochs").pack(side="left", padx=(10, 2))
+        self.var_train_epochs = tk.StringVar(value="30")
+        self.ent_train_epochs = ttk.Entry(
+            self.frm_train,
+            textvariable=self.var_train_epochs,
+            width=6,
+        )
+        self.ent_train_epochs.pack(side="left", padx=2)
+
+        ttk.Label(self.frm_train, text="batch").pack(side="left", padx=(10, 2))
+        self.var_train_batch = tk.StringVar(value="256")
+        self.ent_train_batch = ttk.Entry(
+            self.frm_train,
+            textvariable=self.var_train_batch,
+            width=6,
+        )
+        self.ent_train_batch.pack(side="left", padx=2)
+
+        self.var_train_status = tk.StringVar(value="idle")
+        ttk.Label(
+            self.frm_train,
+            textvariable=self.var_train_status,
+            foreground="gray",
+        ).pack(side="left", padx=10)
 
         # ── 参数调节面板 ──
         self._build_params_panel(pad)
@@ -825,6 +865,58 @@ class FishingApp:
         self.txt_log.delete("1.0", "end")
         self.txt_log.config(state="disabled")
 
+    def _set_train_ui_state(self, training: bool):
+        self._training_now = training
+        if training:
+            self.btn_auto_train.config(state="disabled")
+            self.var_train_status.set("training...")
+        else:
+            self.btn_auto_train.config(state="normal")
+            self.var_train_status.set("idle")
+
+    def _push_train_log(self, msg: str):
+        self._train_queue.put(("log", msg))
+
+    def _push_train_done(self, ok: bool, msg: str):
+        self._train_queue.put(("done", ok, msg))
+
+    def _on_auto_train(self):
+        """Adaptive PD 自動学習"""
+        if self._training_now:
+            self._log_msg("[Train] 既に学習中です")
+            return
+
+        try:
+            epochs = int(self.var_train_epochs.get().strip())
+            batch = int(self.var_train_batch.get().strip())
+        except ValueError:
+            self._log_msg("[Train] epochs / batch は整数で入力してください")
+            return
+
+        self._set_train_ui_state(True)
+        self._log_msg("[Train] Adaptive PD 学習を開始します")
+
+        def worker():
+            try:
+                from imitation.train_adaptive_pd import run_training
+
+                result = run_training(
+                    epochs=epochs,
+                    batch_size=batch,
+                    log_fn=self._push_train_log,
+                )
+                self._push_train_done(
+                    True,
+                    f"完了 val_acc={result.best_val_acc:.1%} save={result.save_path}",
+                )
+            except Exception as e:
+                tb = traceback.format_exc()
+                self._push_train_log(tb)
+                self._push_train_done(False, f"失敗: {e}")
+
+        self._train_thread = threading.Thread(target=worker, daemon=True)
+        self._train_thread.start()
+
     def _on_whitelist(self):
         """弹窗: 勾选要钓的鱼种"""
         FISH_NAMES = [
@@ -1122,6 +1214,24 @@ class FishingApp:
     # ══════════════════════════════════════════════════════
 
     def _poll(self):
+        # 学習スレッドのログを回収
+        try:
+            while True:
+                item = self._train_queue.get_nowait()
+                kind = item[0]
+
+                if kind == "log":
+                    self._log_msg(f"[Train] {item[1]}")
+                elif kind == "done":
+                    ok, msg = item[1], item[2]
+                    self._set_train_ui_state(False)
+                    if ok:
+                        self._log_msg(f"[Train] ✅ {msg}")
+                    else:
+                        self._log_msg(f"[Train] ❌ {msg}")
+        except queue.Empty:
+            pass
+        
         """每 100ms 从日志队列读取消息，更新状态面板"""
         # 读取日志
         try:

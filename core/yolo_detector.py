@@ -87,55 +87,6 @@ class YoloDetector:
         )
         log.info(f"[YOLO] ✓ CPU 模式就绪: {self.model.names}")
 
-    def detect_progress_fill_ratio(self, screen, progress_box):
-        """
-        progressバーの緑進捗率を返す
-        戻り値: 0.0 ~ 1.0
-        """
-        if progress_box is None:
-            return 0.0
-
-        x, y, w, h = progress_box[:4]
-        h_img, w_img = screen.shape[:2]
-
-        x = max(0, min(x, w_img - 1))
-        y = max(0, min(y, h_img - 1))
-        w = max(1, min(w, w_img - x))
-        h = max(1, min(h, h_img - y))
-
-        roi = screen[y:y+h, x:x+w]
-        if roi.size == 0:
-            return 0.0
-
-        pad_x = max(1, int(w * 0.03))
-        pad_y = max(1, int(h * 0.15))
-
-        x1 = pad_x
-        y1 = pad_y
-        x2 = max(x1 + 1, w - pad_x)
-        y2 = max(y1 + 1, h - pad_y)
-
-        roi = roi[y1:y2, x1:x2]
-        if roi.size == 0:
-            return 0.0
-
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-
-        lower = np.array([35, 60, 60], dtype=np.uint8)
-        upper = np.array([90, 255, 255], dtype=np.uint8)
-
-        mask = cv2.inRange(hsv, lower, upper)
-        col_ratio = mask.mean(axis=0) / 255.0
-        filled = col_ratio > 0.25
-
-        if not np.any(filled):
-            return 0.0
-
-        rightmost = np.where(filled)[0].max()
-        fill_ratio = (rightmost + 1) / len(filled)
-
-        return float(np.clip(fill_ratio, 0.0, 1.0))
-
     def detect(self, screen, roi=None):
         """
         对一帧画面执行 YOLO 推理。
@@ -172,14 +123,17 @@ class YoloDetector:
         #           max(h,w) <  400px → 向上取整到最近的 32 倍数，最低 320
         _h, _w = img.shape[:2]
         _max_dim = max(_h, _w)
-        if _max_dim < 400:
-            _infer_size = max(320, ((_max_dim + 31) // 32) * 32)
-        else:
-            _infer_size = 640
+        # 推論サイズは固定
+        _infer_size = 416
 
         results = self.model.predict(
-            img, conf=self.conf, device=self._device,
-            verbose=False, imgsz=_infer_size,
+            img,
+            conf=self.conf,
+            device=self._device,
+            verbose=False,
+            imgsz=_infer_size,
+            half=(self._device != "cpu"),
+            max_det=8,
         )
 
         detections = {
