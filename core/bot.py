@@ -25,10 +25,104 @@ from utils.logger import log
 import ctypes
 import csv
 from collections import deque
+import math
+import random
+import pickle
+
 
 # 遅延ロード用のYOLO検出器
 _yolo_detector = None
 _yolo_device_used = None
+
+class OnlineHoldRL:
+    """
+    高品質PDが出した base_hold に対して、
+    delta_hold だけを学習する超軽量オンラインQ学習器。
+    """
+
+    def __init__(self):
+        self.actions = list(getattr(config, "RL_HOLD_ACTIONS", [-0.03, -0.015, -0.008, 0.0, 0.008, 0.015, 0.03]))
+        self.alpha = float(getattr(config, "RL_ALPHA", 0.08))
+        self.gamma = float(getattr(config, "RL_GAMMA", 0.96))
+        self.epsilon = float(getattr(config, "RL_EPSILON", 0.08))
+        self.q = {}
+
+        self.last_state = None
+        self.last_action = None
+
+        self._load()
+
+    def _key(self, state):
+        return tuple(state)
+
+    def _ensure(self, s):
+        k = self._key(s)
+        if k not in self.q:
+            self.q[k] = [0.0 for _ in self.actions]
+        return k
+
+    def act(self, state):
+        k = self._ensure(state)
+
+        if random.random() < self.epsilon:
+            a = random.randrange(len(self.actions))
+        else:
+            qv = self.q[k]
+            mx = max(qv)
+            best = [i for i, v in enumerate(qv) if v == mx]
+            a = random.choice(best)
+
+        self.last_state = tuple(state)
+        self.last_action = a
+        return self.actions[a], a
+
+    def update(self, reward, next_state, done=False):
+        if self.last_state is None or self.last_action is None:
+            return
+
+        s = self._ensure(self.last_state)
+        ns = self._ensure(next_state)
+
+        q_old = self.q[s][self.last_action]
+        q_next = 0.0 if done else max(self.q[ns])
+
+        self.q[s][self.last_action] = q_old + self.alpha * (
+            reward + self.gamma * q_next - q_old
+        )
+
+        if done:
+            self.last_state = None
+            self.last_action = None
+
+    def save(self):
+        path = getattr(config, "RL_MODEL_PATH", None)
+        if not path:
+            return
+        try:
+            with open(path, "wb") as f:
+                pickle.dump({
+                    "q": self.q,
+                    "actions": self.actions,
+                    "alpha": self.alpha,
+                    "gamma": self.gamma,
+                    "epsilon": self.epsilon,
+                }, f)
+        except Exception as e:
+            log.warning(f"[RL] save失敗: {e}")
+
+    def _load(self):
+        path = getattr(config, "RL_MODEL_PATH", None)
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, "rb") as f:
+                d = pickle.load(f)
+            self.q = d.get("q", {})
+            if "actions" in d:
+                self.actions = d["actions"]
+            log.info(f"[RL] Q-table 読み込み完了: {path} states={len(self.q)}")
+        except Exception as e:
+            log.warning(f"[RL] load失敗: {e}")
 
 
 def _get_yolo_detector(force_reload=False):
@@ -117,6 +211,13 @@ class FishingBot:
         self._pd_last_bar_box = None
         self._pd_last_progress = 0.0
         self._pd_last_end_reason = ""
+
+        # ── Residual RL ──
+        self._rl = OnlineHoldRL() if getattr(config, "RL_ENABLE", False) else None
+        self._rl_prev_state = None
+        self._rl_prev_progress = 0.0
+        self._rl_prev_abs_error = None
+        self._rl_episode_reward = 0.0
 
         # ── Debug overlay（別スレッド描画。釣り処理を止めない） ──
         self._last_overlay_time = 0
@@ -871,6 +972,11 @@ class FishingBot:
         self._il_prev_velocity = 0.0
         self._il_log_counter = 0
 
+        self._rl_prev_state = None
+        self._rl_prev_progress = 0.0
+        self._rl_prev_abs_error = None
+        self._rl_episode_reward = 0.0
+
         # ── PD教師データ収集状態を毎回リセット ──
         if config.PD_RECORD and (not config.IL_RECORD) and (not config.IL_USE_MODEL):
             self._pd_start_recording()
@@ -1020,7 +1126,7 @@ class FishingBot:
         _prev_green = 0.0
 
         # ── 成功判定用: 終了直前60フレームの進捗履歴 ──
-        green_history = deque(maxlen=60)
+        green_history = deque(maxlen=20)
 
         # ── 直前5フレーム補完用バッファ ──
         recent_fish = deque(maxlen=5)
@@ -1807,7 +1913,23 @@ class FishingBot:
                     f"{config.SUCCESS_PROGRESS:.0%} のため失敗判定 "
                     f"(max={_last_green:.0%})"
                 )
+                        # ── RL終端学習 ──
+            if self._rl is not None:
+                terminal_reward = (
+                    getattr(config, "RL_SUCCESS_REWARD", 2.5)
+                    if success else
+                    getattr(config, "RL_FAIL_REWARD", -2.5)
+                )
+                self._rl_episode_reward += terminal_reward
 
+                dummy_next_state = self._rl_prev_state if self._rl_prev_state is not None else (0, 0, 0, 0, 0, 0)
+                self._rl.update(terminal_reward, dummy_next_state, done=True)
+                self._rl.save()
+
+                log.info(
+                    f"[RL] episode_reward={self._rl_episode_reward:+.3f} "
+                    f"terminal={terminal_reward:+.2f}"
+                )
             # PD教師データのエピソード終端記録
             if config.PD_RECORD and (not config.IL_RECORD) and (not config.IL_USE_MODEL):
                 try:
@@ -2571,20 +2693,60 @@ class FishingBot:
             self._il_log_counter += 1
             return False
 
+    @staticmethod
+    def _clip(v, lo, hi):
+        return max(lo, min(hi, v))
+
+    @staticmethod
+    def _bin(v, lo, hi, bins):
+        v = max(lo, min(hi, v))
+        if hi - lo < 1e-9:
+            return 0
+        r = (v - lo) / (hi - lo)
+        idx = int(r * bins)
+        if idx >= bins:
+            idx = bins - 1
+        if idx < 0:
+            idx = 0
+        return idx
+
+    def _build_rl_state(self, *, error_px, bar_velocity, fish_delta, fish_in_bar, base_hold, progress):
+        """
+        Q-table用に状態を粗く離散化する
+        """
+        return (
+            self._bin(error_px,      -180, 180, getattr(config, "RL_ERR_BIN", 12)),
+            self._bin(bar_velocity,  -900, 900, getattr(config, "RL_VEL_BIN", 8)),
+            self._bin(fish_delta,    -80,   80, getattr(config, "RL_FISHDELTA_BIN", 6)),
+            self._bin(fish_in_bar,   -0.5, 1.5, getattr(config, "RL_FIB_BIN", 8)),
+            self._bin(base_hold,      0.0, 0.12, getattr(config, "RL_HOLD_BIN", 8)),
+            self._bin(progress,       0.0, 1.0, getattr(config, "RL_PROG_BIN", 8)),
+        )
+
+    def _calc_rl_step_reward(self, *, abs_error, fish_in_bar, progress, prev_abs_error):
+        reward = 0.0
+
+        # バー内維持
+        if 0.0 <= fish_in_bar <= 1.0:
+            reward += getattr(config, "RL_REWARD_IN_BAR", 0.06)
+        else:
+            reward += getattr(config, "RL_REWARD_OUTSIDE", -0.04)
+
+        # 中央へ寄ったら加点、離れたら減点
+        if prev_abs_error is not None:
+            improve = prev_abs_error - abs_error
+            reward += improve * getattr(config, "RL_REWARD_CENTER_GAIN", 0.10) / 50.0
+
+        # progress増加
+        dprog = progress - self._rl_prev_progress
+        reward += dprog * getattr(config, "RL_REWARD_PROGRESS_GAIN", 0.20)
+
+        return float(reward)
+
     def _control_mouse(self, fish, bar, sr) -> bool:
         """
-        PD物理制御器（Stardew Valley型の釣りUI向け）
-
-        物理モデル:
-        - マウス押下 → 白バーが上向き加速
-        - マウス解放 → 重力で減速 → 停止 → 下向き加速
-        - 白バーには慣性がある
-
-        制御方針:
-        - 誤差 = 白バー中心 - 魚中心
-        - 速度 = 白バー移動速度
-        - 速度込みで将来位置を予測
-        - 予測誤差に応じて押下時間を決定
+        高品質PD + residual RL
+        RLは base_hold に delta_hold を足すだけ。
         """
         now = time.time()
 
@@ -2607,7 +2769,6 @@ class FishingBot:
 
         vel = self._bar_velocity
 
-        # ── PD制御パラメータ ──
         TARGET_FIB = 0.5
         KP         = getattr(config, 'HOLD_GAIN', 0.040)
         KD         = getattr(config, 'SPEED_DAMPING', 0.00025)
@@ -2615,7 +2776,6 @@ class FishingBot:
         MAX_HOLD   = getattr(config, 'HOLD_MAX_S', 0.100)
         MIN_HOLD   = 0.004
 
-        # 教師データ収集用の既定値
         action_press = 0
         control_value = 0.0
         in_deadzone = False
@@ -2625,38 +2785,72 @@ class FishingBot:
             raw_fish_cy = fish[1] + fish[3] // 2
             bar_cy      = bar[1] + bar[3] // 2
 
-            # 魚位置をEMAで平滑化
+            # 魚位置EMA
             if self._fish_smooth_cy is None:
                 self._fish_smooth_cy = float(raw_fish_cy)
             else:
-                self._fish_smooth_cy = (
-                    0.4 * raw_fish_cy + 0.6 * self._fish_smooth_cy
-                )
+                self._fish_smooth_cy = 0.4 * raw_fish_cy + 0.6 * self._fish_smooth_cy
 
             fish_cy = int(self._fish_smooth_cy)
             bar_h   = max(bar[3], 1)
             bar_top = bar[1]
             fish_in_bar = (fish_cy - bar_top) / bar_h
 
-            # PD誤差計算
             error = TARGET_FIB - fish_in_bar
             error_clamp = max(-2.0, min(2.0, error))
 
-            # hold = 基準 + 位置補正 + 速度ダンピング
-            # vel>0（下落中）→ holdを増やして減速
-            # vel<0（上昇中）→ holdを減らしてオーバーシュート防止
-            hold = BASE_HOLD + error_clamp * KP + vel * KD
-            hold = max(MIN_HOLD, min(hold, MAX_HOLD))
+            # まずPDだけで base_hold を作る
+            base_hold = BASE_HOLD + error_clamp * KP + vel * KD
+            base_hold = max(MIN_HOLD, min(base_hold, MAX_HOLD))
 
-            action_press = 1 if hold >= MIN_HOLD + 0.001 else 0
-            control_value = float(hold)
+            fish_delta = 0.0
+            if self._last_fish_cy is not None:
+                fish_delta = fish_cy - self._last_fish_cy
+
+            abs_error_px = abs(bar_cy - fish_cy)
+
+            final_hold = base_hold
+            delta_hold = 0.0
+
+            # ── RL補正 ──
+            if self._rl is not None:
+                state = self._build_rl_state(
+                    error_px=(bar_cy - fish_cy),
+                    bar_velocity=vel,
+                    fish_delta=fish_delta,
+                    fish_in_bar=fish_in_bar,
+                    base_hold=base_hold,
+                    progress=self._pd_last_progress,
+                )
+
+                # 1ステップ前の行動を今の観測で学習
+                step_reward = self._calc_rl_step_reward(
+                    abs_error=abs_error_px,
+                    fish_in_bar=fish_in_bar,
+                    progress=self._pd_last_progress,
+                    prev_abs_error=self._rl_prev_abs_error,
+                )
+                self._rl_episode_reward += step_reward
+                self._rl.update(step_reward, state, done=False)
+
+                # 今回の補正量を選ぶ
+                delta_hold, _ = self._rl.act(state)
+
+                # 安全のため補正幅は base_hold 依存で少し制限してもよい
+                final_hold = base_hold + delta_hold
+                final_hold = max(MIN_HOLD, min(final_hold, MAX_HOLD))
+
+                self._rl_prev_state = state
+                self._rl_prev_progress = self._pd_last_progress
+                self._rl_prev_abs_error = abs_error_px
+
+            action_press = 1 if final_hold >= MIN_HOLD + 0.001 else 0
+            control_value = float(final_hold)
             in_deadzone = abs(error) < 0.05
 
-            # 最終観測保存
             self._pd_last_fish_box = fish
             self._pd_last_bar_box = bar
 
-            # 教師データ1フレーム記録
             if config.PD_RECORD and (not config.IL_RECORD) and (not config.IL_USE_MODEL):
                 self._pd_record_frame(
                     fish_box=fish,
@@ -2671,8 +2865,7 @@ class FishingBot:
                     episode_success=0,
                 )
 
-            # フォールバック用に保存
-            self._last_hold = hold
+            self._last_hold = final_hold
             self._last_fish_cy = fish_cy
 
             fname = (self._current_fish_name.replace("fish_", "")
@@ -2680,31 +2873,33 @@ class FishingBot:
 
             if action_press:
                 self.input.mouse_down()
-                time.sleep(hold)
+                time.sleep(final_hold)
                 self.input.mouse_up()
-                log.info(
-                    f"  ● [{fname}] fib={fish_in_bar:.2f} "
-                    f"v={vel:+.0f} → 押下 {hold*1000:.0f}ms"
-                )
+
+                if self._rl is not None:
+                    log.info(
+                        f"  ● [{fname}] fib={fish_in_bar:.2f} v={vel:+.0f} "
+                        f"PD={base_hold*1000:.0f}ms RL={delta_hold*1000:+.0f}ms "
+                        f"→ {final_hold*1000:.0f}ms"
+                    )
+                else:
+                    log.info(
+                        f"  ● [{fname}] fib={fish_in_bar:.2f} v={vel:+.0f} "
+                        f"→ 押下 {final_hold*1000:.0f}ms"
+                    )
                 return True
             else:
                 self.input.mouse_up()
-                log.info(
-                    f"  ○ [{fname}] fib={fish_in_bar:.2f} "
-                    f"v={vel:+.0f} → 解放"
-                )
                 return False
 
-        # ── フォールバック: 魚のみ / バーのみ ──
+        # ── フォールバック時は従来通り ──
         fallback = self._last_hold
         if fallback is None:
             fallback = BASE_HOLD
 
-        # 完全観測できないときは基準値へ徐々に戻す
         fallback = 0.6 * fallback + 0.4 * BASE_HOLD
         self._last_hold = fallback
 
-        # 魚だけ見えている場合
         if fish is not None:
             fish_cy = fish[1] + fish[3] // 2
             self._last_fish_cy = fish_cy
@@ -2719,52 +2914,19 @@ class FishingBot:
 
             if fish_cy < mid_y:
                 h = min(fallback * 1.5, MAX_HOLD)
-                action_press = 1
-                control_value = float(h)
-                in_deadzone = False
-
                 self.input.mouse_down()
                 time.sleep(h)
                 self.input.mouse_up()
-
-                log.info(
-                    f"  (魚のみ) Y={fish_cy} v={vel:+.0f}"
-                    f" → 押下 {h*1000:.0f}ms"
-                )
                 return True
             else:
-                action_press = 0
-                control_value = 0.0
-                in_deadzone = False
                 self.input.mouse_up()
                 return False
 
-        # バーだけ見えている場合
         elif bar is not None:
-            bar_cy = bar[1] + bar[3] // 2
             self._pd_last_bar_box = bar
-
-            if self._last_fish_cy is not None:
-                est_fib = (self._last_fish_cy - bar[1]) / max(bar[3], 1)
-                error = TARGET_FIB - est_fib
-                error_clamp = max(-2.0, min(2.0, error))
-                hold = BASE_HOLD + error_clamp * KP + vel * KD
-                hold = max(MIN_HOLD, min(hold, MAX_HOLD))
-            else:
-                hold = fallback
-
-            action_press = 1 if hold >= MIN_HOLD + 0.001 else 0
-            control_value = float(hold)
-            in_deadzone = False
-
             self.input.mouse_down()
-            time.sleep(hold)
+            time.sleep(fallback)
             self.input.mouse_up()
-
-            log.info(
-                f"  (バーのみ) Y={bar_cy} v={vel:+.0f}"
-                f" → 押下 {hold*1000:.0f}ms"
-            )
             return True
 
         return False
