@@ -9,10 +9,11 @@ YOLO 标注辅助工具
   1 = bar      (白色捕捉条)
   2 = track    (钓鱼轨道)
   3 = progress (绿色进度条)
+  4 = hook     (进度上端钩点/标记)
 
 操作:
   鼠标拖拽  = 画框
-  1/2/3/4   = 设置类别 (fish/bar/track/progress)
+  1/2/3/4/5 = 设置类别 (fish/bar/track/progress/hook)
   Z         = 撤销上一个框
   S / Enter = 保存并下一张
   D         = 删除当前图片 (跳过)
@@ -42,12 +43,19 @@ TRAIN_LBL = os.path.join(BASE, "labels", "train")
 VAL_IMG = os.path.join(BASE, "images", "val")
 VAL_LBL = os.path.join(BASE, "labels", "val")
 
-CLASS_NAMES = {0: "fish", 1: "bar", 2: "track", 3: "progress"}
+CLASS_NAMES = {
+    0: "fish",
+    1: "bar",
+    2: "track",
+    3: "progress",
+    4: "hook",
+}
 CLASS_COLORS = {
     0: (0, 255, 0),       # fish - green
     1: (255, 255, 255),   # bar - white
     2: (255, 100, 0),     # track - orange
     3: (0, 200, 255),     # progress - yellow-green
+    4: (0, 0, 255),       # hook - red
 }
 
 drawing = False
@@ -70,9 +78,11 @@ def draw_overlay():
         cv2.putText(img_display, label, (x1, y1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-    info = (f"Class: {current_class}={CLASS_NAMES.get(current_class, '?')} | "
-            f"Boxes: {len(boxes)} | "
-            f"[1]fish [2]bar [3]track [4]progress [Z]undo [S]save [D]skip [Q]quit")
+    info = (
+        f"Class: {current_class}={CLASS_NAMES.get(current_class, '?')} | "
+        f"Boxes: {len(boxes)} | "
+        f"[1]fish [2]bar [3]track [4]progress [5]hook [Z]undo [S]save [D]skip [Q]quit"
+    )
     cv2.putText(img_display, info, (5, h - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
 
@@ -212,6 +222,11 @@ def _label_loop(files_with_paths, save_func, mode_name="标注"):
                 print(f"    类别 → progress (3)")
                 draw_overlay()
                 cv2.imshow("Label Tool", img_display)
+            elif key == ord("5"):
+                current_class = 4
+                print(f"    类别 → hook (4)")
+                draw_overlay()
+                cv2.imshow("Label Tool", img_display)
             elif key == ord("z") or key == ord("Z"):
                 if boxes:
                     removed = boxes.pop()
@@ -290,7 +305,7 @@ def _relabel_mode():
     """重新标注模式: 遍历 train/ 和 val/ 中已有图片，加载标注后让用户补标"""
     print("=" * 50)
     print("  补标模式 (relabel)")
-    print("  加载已有标注，按 [4] 选择 progress 类别后画框")
+    print("  加载已有标注，按 [4]/[5] 选择 progress/hook 类别后画框")
     print("  按 [S] 保存  |  [D] 跳过  |  [Q] 退出")
     print("=" * 50)
     print()

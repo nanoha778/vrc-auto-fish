@@ -8,13 +8,11 @@ best.pt を使って unlabeled を自動ラベルするスクリプト
 - best.pt で推論
 - 高信頼画像は train にコピーし、labels/train に YOLO txt を保存
 - 低信頼 or 未検出画像は auto_review にコピー
-- 元の unlabeled は消さない（copy運用）
+- 元の unlabeled は消さない（copy运用）
 
-実行例:
+实行例:
     python yolo/auto_label.py
-
     python yolo/auto_label.py --conf 0.70 --avg-conf 0.80
-
     python yolo/auto_label.py --model D:\\vrc-auto-fish-stable\\yolo\\runs\\fish_detect\\weights\\best.pt
 """
 
@@ -34,7 +32,7 @@ import config
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
-CLASS_NAMES = ["fish", "bar", "track", "progress"]
+CLASS_NAMES = ["fish", "bar", "track", "progress", "hook"]
 
 
 def ensure_dir(path: Path) -> None:
@@ -66,6 +64,7 @@ def save_preview(
         1: (255, 255, 255),  # bar
         2: (0, 180, 255),    # track
         3: (0, 220, 180),    # progress
+        4: (0, 0, 255),      # hook
     }
 
     if boxes is not None:
@@ -115,7 +114,9 @@ def main():
     parser.add_argument("--require-track", action="store_true",
                         help="accept only if track class exists")
     parser.add_argument("--require-progress", action="store_true",
-                    help="accept only if progress class exists")
+                        help="accept only if progress class exists")
+    parser.add_argument("--require-hook", action="store_true",
+                        help="accept only if hook class exists")
     args = parser.parse_args()
 
     try:
@@ -247,7 +248,14 @@ def main():
             save_preview(img, boxes, review_preview_dir / img_path.name)
             reviewed += 1
             continue
+
         if args.require_progress and 3 not in found_classes:
+            shutil.copy2(img_path, review_img_dir / img_path.name)
+            save_preview(img, boxes, review_preview_dir / img_path.name)
+            reviewed += 1
+            continue
+
+        if args.require_hook and 4 not in found_classes:
             shutil.copy2(img_path, review_img_dir / img_path.name)
             save_preview(img, boxes, review_preview_dir / img_path.name)
             reviewed += 1

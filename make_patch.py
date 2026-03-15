@@ -1,10 +1,13 @@
 """
-生成更新补丁
-============
-用法: python make_patch.py
+更新パッチ生成スクリプト
+=======================
+使い方: python make_patch.py
 
-将 config.py, core/, gui/, utils/ 等应用代码打包为 patch.zip。
-用户解压到 exe 同级目录即可完成更新 (会生成 patch/ 文件夹)。
+config.py, core/, gui/, utils/ などのコードを
+patch.zip にまとめる。
+
+ユーザーは exe と同じディレクトリに展開するだけで
+更新できる（patch/フォルダが生成される）。
 """
 
 import os

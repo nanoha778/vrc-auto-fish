@@ -1,16 +1,21 @@
 """
-PyInstaller 运行时钩子 — 补丁加载器
-====================================
-如果 exe 旁边有 patch/ 目录, 里面的 .py 文件会覆盖打包时的冻结代码。
-优先级: patch/ > 冻结代码
+PyInstaller 実行時フック — パッチローダー
+==========================================
 
-补丁目录结构示例:
-  patch/
-    config.py            ← 覆盖 config 模块
-    core/
-      bot.py             ← 覆盖 core.bot
-    gui/
-      app.py             ← 覆盖 gui.app
+exe の横に patch/ ディレクトリがある場合、
+中の .py ファイルで凍結コードを上書きする。
+
+優先順位
+patch/ > exe 内のコード
+
+例:
+
+patch/
+  config.py
+  core/
+    bot.py
+  gui/
+    app.py
 """
 import sys
 import os

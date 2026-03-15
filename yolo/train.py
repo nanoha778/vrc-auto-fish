@@ -3,6 +3,13 @@ YOLO 模型训练脚本
 ================
 用标注好的数据集训练 YOLOv8n 目标检测模型。
 
+类别:
+  0 = fish
+  1 = bar
+  2 = track
+  3 = progress
+  4 = hook
+
 用法:
     python -m yolo.train                   # 默认训练
     python -m yolo.train --epochs 100      # 指定轮数
