@@ -34,7 +34,7 @@ import config
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
-CLASS_NAMES = ["fish", "bar", "track", "progress"]
+CLASS_NAMES = ["fish", "bar", "track", "progress_bar", "progress"]
 
 
 def ensure_dir(path: Path) -> None:
@@ -65,7 +65,8 @@ def save_preview(
         0: (0, 255, 0),      # fish
         1: (255, 255, 255),  # bar
         2: (0, 180, 255),    # track
-        3: (0, 220, 180),    # progress
+        3: (255, 0, 255),    # progress_bar
+        4: (0, 220, 180),    # progress
     }
 
     if boxes is not None:
@@ -114,8 +115,10 @@ def main():
                         help="accept only if bar class exists")
     parser.add_argument("--require-track", action="store_true",
                         help="accept only if track class exists")
+    parser.add_argument("--require-progress-bar", action="store_true",
+                        help="accept only if progress_bar class exists")
     parser.add_argument("--require-progress", action="store_true",
-                    help="accept only if progress class exists")
+                        help="accept only if progress class exists")
     args = parser.parse_args()
 
     try:
@@ -247,7 +250,13 @@ def main():
             save_preview(img, boxes, review_preview_dir / img_path.name)
             reviewed += 1
             continue
-        if args.require_progress and 3 not in found_classes:
+        if args.require_progress_bar and 3 not in found_classes:
+            shutil.copy2(img_path, review_img_dir / img_path.name)
+            save_preview(img, boxes, review_preview_dir / img_path.name)
+            reviewed += 1
+            continue
+
+        if args.require_progress and 4 not in found_classes:
             shutil.copy2(img_path, review_img_dir / img_path.name)
             save_preview(img, boxes, review_preview_dir / img_path.name)
             reviewed += 1

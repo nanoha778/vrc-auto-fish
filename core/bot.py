@@ -29,6 +29,7 @@ import pickle
 _yolo_detector = None
 _yolo_device_used = None
 
+
 class OnlineHoldRL:
     """
     PDが出した base_hold に対して delta_hold を選ぶだけの超軽量オンライン学習器。
@@ -53,6 +54,9 @@ class OnlineHoldRL:
         self.prev_state = None
         self.prev_action = None
         self.prev_hold = 0.0
+
+        # 維持率系の状態
+        self.inside_streak = 0
 
         # 学習統計
         self.total_steps = 0
@@ -92,24 +96,64 @@ class OnlineHoldRL:
         self.prev_hold = hold
         return hold
 
-    def step_reward(self, error, prev_error=None):
+    def terminal_reward(self, success: bool, end_reason: str = ""):
         """
-        error: 0に近いほど良い
-        prev_error: 1ステップ前の error
+        エピソード終了時の一発報酬。
+        成功なら大きく加点、失敗なら軽く減点。
+        end_reason に応じて微調整してもよい。
         """
-        abs_err = abs(error)
+        if success:
+            reward = 1.2
+        else:
+            reward = -0.35
+
+        # 任意: 終了理由で少し補正
+        if not success:
+            if end_reason in {"fish_lost_limit", "fish_gone_timeout"}:
+                reward -= 0.10
+            elif end_reason in {"bar_gone_timeout"}:
+                reward -= 0.08
+            elif end_reason in {"track_lost_limit", "track_lost_limit_quick"}:
+                reward -= 0.05
+            elif end_reason in {"ui_gone_limit", "obj_gone_limit"}:
+                # UI消失系は成功終了の可能性もあるので失敗時でも罰を軽め
+                reward -= 0.02
+
+        self.last_reward = reward
+        return reward
+
+    def step_reward(self, fish_in_bar, prev_fish_in_bar=None):
+        """
+        fish_in_bar:
+            白バー上端を 0.0、下端を 1.0 とした魚位置
+            0.0～1.0 ならバー内
+        prev_fish_in_bar:
+            1ステップ前の fish_in_bar
+        """
+        center_err = abs(0.5 - fish_in_bar)
+        inside = 0.0 <= fish_in_bar <= 1.0
 
         reward = 0.0
 
-        # 現在のズレが小さいほど良い
-        reward -= abs_err * 0.25
+        # 1) 中心に近いほど良い
+        reward -= center_err * 0.18
 
-        # 前ステップより改善していれば加点
-        if prev_error is not None:
-            reward += (abs(prev_error) - abs_err) * 0.5
+        # 2) バー内維持そのものに報酬
+        if inside:
+            reward += 0.10
+            self.inside_streak += 1
+            reward += min(self.inside_streak, 20) * 0.005
+        else:
+            reward -= 0.12
+            self.inside_streak = 0
 
-        # 長押ししすぎをわずかに抑制
-        reward -= self.prev_hold * 0.02
+        # 3) 前フレームより中心に近づいたら加点
+        if prev_fish_in_bar is not None:
+            prev_center_err = abs(0.5 - prev_fish_in_bar)
+            reward += (prev_center_err - center_err) * 0.25
+
+        # 4) 長押ししすぎをわずかに抑制
+        reward -= self.prev_hold * 0.015
 
         self.last_reward = reward
         return reward
@@ -137,6 +181,7 @@ class OnlineHoldRL:
         self.prev_state = None
         self.prev_action = None
         self.prev_hold = 0.0
+        self.inside_streak = 0
 
     def save(self):
         try:
@@ -935,6 +980,9 @@ class FishingBot:
         self.state = "ミニゲーム中"
         log.info("[🐟 釣り] ミニゲーム開始")
 
+
+        green_history = deque(maxlen=60)
+
         # ── 行動クローニング: 毎回リセット ──
         self._il_history.clear()
         self._il_prev_fish_cy = None
@@ -1095,6 +1143,7 @@ class FishingBot:
         recent_fish = deque(maxlen=5)
         recent_bar = deque(maxlen=5)
         recent_progress = deque(maxlen=5)
+        recent_progress_bar = deque(maxlen=5)
 
         def _push_recent(buf, value, frame_no):
             if value is not None:
@@ -1201,12 +1250,14 @@ class FishingBot:
                 _matched_key = None
                 _bar_scale = 1.0
                 _yolo_progress = None
+                _yolo_progress_bar = None
 
                 if _use_yolo:
                     _yolo_roi = config.DETECT_ROI
                     _ydet = self.yolo.detect(screen, roi=_yolo_roi)
                     fish = _ydet["fish"]
                     bar = _ydet["bar"]
+                    _yolo_progress_bar = _ydet.get("progress_bar")
                     _yolo_progress = _ydet.get("progress")
 
                     if fish is not None:
@@ -1349,7 +1400,10 @@ class FishingBot:
                 # ── 補完前の有効検出だけ履歴へ保存 ──
                 _push_recent(recent_fish, fish, frame)
                 _push_recent(recent_bar, bar, frame)
+                _push_recent(recent_progress_bar, _yolo_progress_bar, frame)
                 _push_recent(recent_progress, _yolo_progress, frame)
+                
+                
 
                 if fish is not None:
                     self._current_fish_name = fish_detect_name
@@ -1464,10 +1518,15 @@ class FishingBot:
                     if bar is not None and frame % 10 == 1:
                         log.info("  ↺ 白バーを直前5フレームの履歴で補完しました")
 
+                if _yolo_progress_bar is None:
+                    _yolo_progress_bar = _get_recent(recent_progress_bar, frame, max_age=5)
+                    if _yolo_progress_bar is not None and frame % 10 == 1:
+                        log.info("  ↺ progress_bar を直前5フレームの履歴で補完しました")
+
                 if _yolo_progress is None:
                     _yolo_progress = _get_recent(recent_progress, frame, max_age=5)
                     if _yolo_progress is not None and frame % 10 == 1:
-                        log.info("  ↺ 進捗バーを直前5フレームの履歴で補完しました")
+                        log.info("  ↺ progress を直前5フレームの履歴で補完しました")
 
                 if fish is not None:
                     self._pd_last_fish_box = fish
@@ -1479,6 +1538,7 @@ class FishingBot:
                     self._show_debug_overlay(
                         screen_raw, fish, bar, search_region,
                         bar_search_region=bar_search_region,
+                        progress_bar=_yolo_progress_bar,
                         progress=_yolo_progress,
                         status_text=f"🐟 ミニゲーム F{frame:04d}"
                     )
@@ -1496,10 +1556,13 @@ class FishingBot:
                 if frame <= _PROGRESS_SKIP_FRAMES:
                     pass
 
-                elif _use_yolo and _yolo_progress is not None:
+                elif _use_yolo and _yolo_progress_bar is not None:
                     green = self.yolo.detect_progress_fill_ratio(
-                        screen, _yolo_progress
+                        screen,
+                        _yolo_progress_bar,
+                        _yolo_progress,
                     )
+
 
                     if not self._progress_debug_saved and green > 0:
                         self._progress_debug_saved = True
@@ -1556,6 +1619,8 @@ class FishingBot:
                         f"  進捗が急落 {_prev_green:.0%}→{green:.0%} のため平滑化します"
                     )
                     green = _prev_green * 0.7 + green * 0.3
+
+                green_history.append(green)
 
                 if green > 0:
                     _prev_green = green
@@ -1708,17 +1773,75 @@ class FishingBot:
                     f"[⏭ スキップ] 対象外の魚のため放棄しました "
                     f"(進捗 {_last_green:.0%} は無効)"
                 )
-            elif _last_green > config.SUCCESS_PROGRESS:
-                success = True
-                log.info(
-                    f"[✅ 成功] 最終進捗 {_last_green:.0%} > "
-                    f"{config.SUCCESS_PROGRESS:.0%} のため成功判定"
-                )
             else:
+                success_end_reasons = {
+                    "ui_gone_limit",
+                    "obj_gone_limit",
+                }
+
+                maybe_success_end_reasons = {
+                    "track_lost_limit",
+                }
+
+                last = list(green_history)[-60:] if green_history else []
+
+                # 0%除外
+                valid = [g for g in last if 0.001 < g < 0.999]
+
+                if valid:
+                    avg_green = sum(valid) / len(valid)
+
+                    if avg_green >= config.SUCCESS_PROGRESS:
+                        metric = max(valid)
+                    else:
+                        metric = min(valid)
+                else:
+                    avg_green = 0.0
+                    metric = 0.0
+
+                if end_reason in success_end_reasons:
+                    success = metric > config.SUCCESS_PROGRESS
+                elif end_reason in maybe_success_end_reasons:
+                    success = metric > (config.SUCCESS_PROGRESS + 0.08)
+                else:
+                    success = False
+
                 log.info(
-                    f"[❌ 失敗] 最終進捗 {_last_green:.0%} <= "
-                    f"{config.SUCCESS_PROGRESS:.0%} のため失敗判定"
+                    f"[判定] end_reason={end_reason} "
+                    f"last={[f'{x:.0%}' for x in last]} "
+                    f"valid={[f'{x:.0%}' for x in valid]} "
+                    f"avg={avg_green:.0%} metric={metric:.0%} "
+                    f"thr={config.SUCCESS_PROGRESS:.0%}"
                 )
+
+                if success:
+                    log.info("[✅ 成功] 終了直前10フレーム判定で成功")
+                else:
+                    log.info("[❌ 失敗] 終了直前10フレーム判定で失敗")
+
+            # ── RL: 成功/失敗の終端報酬を最後に流す ──
+            if self.rl_enabled:
+                if self.rl_hold.prev_state is not None and self.rl_hold.prev_action is not None:
+                    terminal_reward = self.rl_hold.terminal_reward(
+                        success=success,
+                        end_reason=end_reason,
+                    )
+
+                    # done=True の終端更新
+                    self.rl_hold.update(
+                        state=self.rl_hold.prev_state,
+                        action_idx=self.rl_hold.prev_action,
+                        reward=terminal_reward,
+                        next_state=self.rl_hold.prev_state,  # done=True なので実質未使用
+                        done=True,
+                    )
+
+                    log.info(
+                        f"[RL終端] success={success} "
+                        f"end_reason={end_reason} "
+                        f"terminal_reward={terminal_reward:+.3f}"
+                    )
+
             if config.PD_RECORD and (not config.IL_RECORD) and (not config.IL_USE_MODEL):
                 try:
                     self._pd_record_episode_end(
@@ -1780,7 +1903,7 @@ class FishingBot:
 
     def _show_debug_overlay(self, screen, fish=None, bar=None,
                             search_region=None, bar_search_region=None,
-                            progress=None, status_text=""):
+                            progress_bar=None, progress=None, status_text=""):
         """
         统一调试窗口 — 所有阶段可用。
         ★ 先缩小到小图再绘制叠加层，大幅降低 CPU / 内存开销。
@@ -1912,12 +2035,20 @@ class FishingBot:
                      (sx(bx + bw), sy(bar_cy)), (255, 100, 0), 1)
 
         # ── 绘制进度条 (黄绿色) ──
+        if progress_bar is not None:
+            px, py, pw, ph = progress_bar[:4]
+            cv2.rectangle(debug, (sx(px), sy(py)),
+                        (sx(px + pw), sy(py + ph)), (255, 0, 255), 2)
+            cv2.putText(debug, "ProgressBar",
+                        (sx(px), sy(py) - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
+
         if progress is not None:
             px, py, pw, ph = progress[:4]
             cv2.rectangle(debug, (sx(px), sy(py)),
-                          (sx(px + pw), sy(py + ph)), (0, 220, 180), 2)
+                        (sx(px + pw), sy(py + ph)), (0, 220, 180), 2)
             cv2.putText(debug, "Progress",
-                        (sx(px), sy(py) - 5),
+                        (sx(px), sy(py + ph + 14)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 180), 1)
 
         # ── 鱼和白条之间的连线 ──
@@ -2387,10 +2518,16 @@ class FishingBot:
             pd_hold = BASE_HOLD + error_clamp * KP + vel * KD
             pd_hold = max(0.0, min(MAX_HOLD, pd_hold))
 
+
             # RL用の正規化誤差
             error_norm = max(-1.0, min(1.0, error_clamp / 2.0))
             prev_error_norm = self._rl_prev_error
             d_error = error_norm - prev_error_norm
+
+            # 維持率報酬用の前フレーム値
+            prev_fish_in_bar = None
+            if self._last_fish_cy is not None:
+                prev_fish_in_bar = (self._last_fish_cy - bar_top) / bar_h
 
             fish_y_norm = fish_cy / max(1.0, screen_h)
             bar_y_norm = bar_cy / max(1.0, screen_h)
@@ -2416,8 +2553,8 @@ class FishingBot:
                 )
 
                 reward = self.rl_hold.step_reward(
-                    error=error_norm,
-                    prev_error=prev_error_norm,
+                    fish_in_bar=fish_in_bar,
+                    prev_fish_in_bar=prev_fish_in_bar,
                 )
 
                 if self.rl_hold.prev_state is not None and self.rl_hold.prev_action is not None:

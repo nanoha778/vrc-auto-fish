@@ -42,12 +42,19 @@ TRAIN_LBL = os.path.join(BASE, "labels", "train")
 VAL_IMG = os.path.join(BASE, "images", "val")
 VAL_LBL = os.path.join(BASE, "labels", "val")
 
-CLASS_NAMES = {0: "fish", 1: "bar", 2: "track", 3: "progress"}
+CLASS_NAMES = {
+    0: "fish",
+    1: "bar",
+    2: "track",
+    3: "progress_bar",
+    4: "progress",
+}
 CLASS_COLORS = {
-    0: (0, 255, 0),       # fish - green
-    1: (255, 255, 255),   # bar - white
-    2: (255, 100, 0),     # track - orange
-    3: (0, 200, 255),     # progress - yellow-green
+    0: (0, 255, 0),       # fish
+    1: (255, 255, 255),   # bar
+    2: (255, 100, 0),     # track
+    3: (255, 0, 255),     # progress_bar
+    4: (0, 200, 255),     # progress
 }
 
 drawing = False
@@ -72,9 +79,10 @@ def draw_overlay():
 
     info = (f"Class: {current_class}={CLASS_NAMES.get(current_class, '?')} | "
             f"Boxes: {len(boxes)} | "
-            f"[1]fish [2]bar [3]track [4]progress [Z]undo [S]save [D]skip [Q]quit")
+            f"[1]fish [2]bar [3]track [4]progress_bar [5]progress "
+            f"[Z]undo [S]save [D]skip [Q]quit")
     cv2.putText(img_display, info, (5, h - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
 
 
 def mouse_cb(event, x, y, flags, param):
@@ -209,7 +217,12 @@ def _label_loop(files_with_paths, save_func, mode_name="标注"):
                 cv2.imshow("Label Tool", img_display)
             elif key == ord("4"):
                 current_class = 3
-                print(f"    类别 → progress (3)")
+                print(f"    类别 → progress_bar (3)")
+                draw_overlay()
+                cv2.imshow("Label Tool", img_display)
+            elif key == ord("5"):
+                current_class = 4
+                print(f"    类别 → progress (4)")
                 draw_overlay()
                 cv2.imshow("Label Tool", img_display)
             elif key == ord("z") or key == ord("Z"):
@@ -290,7 +303,7 @@ def _relabel_mode():
     """重新标注模式: 遍历 train/ 和 val/ 中已有图片，加载标注后让用户补标"""
     print("=" * 50)
     print("  补标模式 (relabel)")
-    print("  加载已有标注，按 [4] 选择 progress 类别后画框")
+    print("  加载已有标注，按 [4] 选择 progress_bar，[5] 选择 progress 后画框")
     print("  按 [S] 保存  |  [D] 跳过  |  [Q] 退出")
     print("=" * 50)
     print()

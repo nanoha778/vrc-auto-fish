@@ -7,7 +7,8 @@ YOLO 目标检测器
   0 = fish     (鱼图标)      → 返回 (x, y, w, h, conf)
   1 = bar      (白色捕捉条)  → 返回 (x, y, w, h, conf)
   2 = track    (钓鱼轨道)    → 返回 (x, y, w, h, conf)
-  3 = progress (绿色进度条)  → 返回 (x, y, w, h, conf)
+  3 = progress_bar (进度条背景) → 返回 (x, y, w, h, conf)
+  4 = progress (绿色进度条) → 返回 (x, y, w, h, conf)
 """
 
 import os
@@ -29,7 +30,8 @@ class YoloDetector:
     CLASS_FISH = 0
     CLASS_BAR = 1
     CLASS_TRACK = 2
-    CLASS_PROGRESS = 3
+    CLASS_PROGRESS_BAR = 3
+    CLASS_PROGRESS = 4
 
     def __init__(self, model_path: str, conf: float = 0.5, device="auto"):
         if not _YOLO_AVAILABLE:
@@ -87,72 +89,48 @@ class YoloDetector:
         )
         log.info(f"[YOLO] ✓ CPU 模式就绪: {self.model.names}")
 
-    def detect_progress_fill_ratio(self, screen, progress_box):
+    def detect_progress_fill_ratio(self, screen, progress_bar_box, progress_box):
         """
-        progressバーの緑進捗率を返す
+        progress_bar と progress の bbox から進捗率を返す
         戻り値: 0.0 ~ 1.0
+
+        ルール:
+        - progress_bar 未検出 → 0.0
+        - progress_bar あり / progress 未検出 → 0.0
+        - 両方あり → progress_bar 内での充填幅を割合化
         """
+        if progress_bar_box is None:
+            return 0.0
+
+        bx, by, bw, bh = progress_bar_box[:4]
+        if bw <= 1 or bh <= 1:
+            return 0.0
+
         if progress_box is None:
             return 0.0
 
-        x, y, w, h = progress_box[:4]
-        h_img, w_img = screen.shape[:2]
-
-        x = max(0, min(x, w_img - 1))
-        y = max(0, min(y, h_img - 1))
-        w = max(1, min(w, w_img - x))
-        h = max(1, min(h, h_img - y))
-
-        roi = screen[y:y+h, x:x+w]
-        if roi.size == 0:
+        px, py, pw, ph = progress_box[:4]
+        if pw <= 1 or ph <= 1:
             return 0.0
 
-        pad_x = max(1, int(w * 0.03))
-        pad_y = max(1, int(h * 0.15))
+        # bar の左右端
+        bar_left = float(bx)
+        bar_right = float(bx + bw)
 
-        x1 = pad_x
-        y1 = pad_y
-        x2 = max(x1 + 1, w - pad_x)
-        y2 = max(y1 + 1, h - pad_y)
+        # progress の左右端
+        prog_left = float(px)
+        prog_right = float(px + pw)
 
-        roi = roi[y1:y2, x1:x2]
-        if roi.size == 0:
-            return 0.0
+        # progress を bar 範囲内にクリップ
+        clipped_left = max(bar_left, prog_left)
+        clipped_right = min(bar_right, prog_right)
 
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        fill_w = max(0.0, clipped_right - clipped_left)
+        ratio = fill_w / float(bw)
 
-        lower = np.array([35, 60, 60], dtype=np.uint8)
-        upper = np.array([90, 255, 255], dtype=np.uint8)
-
-        mask = cv2.inRange(hsv, lower, upper)
-        col_ratio = mask.mean(axis=0) / 255.0
-        filled = col_ratio > 0.25
-
-        if not np.any(filled):
-            return 0.0
-
-        rightmost = np.where(filled)[0].max()
-        fill_ratio = (rightmost + 1) / len(filled)
-
-        return float(np.clip(fill_ratio, 0.0, 1.0))
+        return float(np.clip(ratio, 0.0, 1.0))
 
     def detect(self, screen, roi=None):
-        """
-        对一帧画面执行 YOLO 推理。
-
-        参数:
-            screen: BGR 图像 (numpy array)
-            roi:    [x, y, w, h] 检测区域 (可选)
-
-        返回:
-            dict: {
-                'fish':  (x, y, w, h, conf) 或 None,
-                'bar':   (x, y, w, h, conf) 或 None,
-                'track': (x, y, w, h, conf) 或 None,
-                'fish_name': str,  # 鱼的类别名称
-                'raw': list,       # 所有检测结果
-            }
-        """
         ox, oy = 0, 0
         img = screen
 
@@ -167,9 +145,6 @@ class YoloDetector:
                 img = screen[ry:ry+rh, rx:rx+rw].copy()
                 ox, oy = rx, ry
 
-        # 动态推理分辨率: ROI 较小时避免把小图放大到 640 浪费算力
-        # 安全阈值: max(h,w) >= 400px → 保持 640 (模型训练分辨率，精度最优)
-        #           max(h,w) <  400px → 向上取整到最近的 32 倍数，最低 320
         _h, _w = img.shape[:2]
         _max_dim = max(_h, _w)
         if _max_dim < 400:
@@ -186,6 +161,7 @@ class YoloDetector:
             "fish": None,
             "bar": None,
             "track": None,
+            "progress_bar": None,
             "progress": None,
             "fish_name": "",
             "raw": [],
@@ -222,6 +198,9 @@ class YoloDetector:
             elif class_name == "track":
                 if detections["track"] is None or conf > detections["track"][4]:
                     detections["track"] = det
+            elif class_name == "progress_bar":
+                if detections["progress_bar"] is None or conf > detections["progress_bar"][4]:
+                    detections["progress_bar"] = det
             elif class_name == "progress":
                 if detections["progress"] is None or conf > detections["progress"][4]:
                     detections["progress"] = det

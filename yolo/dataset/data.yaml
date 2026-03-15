@@ -6,4 +6,5 @@ names:
   0: fish
   1: bar
   2: track
-  3: progress
+  3: progress_bar
+  4: progress

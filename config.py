@@ -59,17 +59,17 @@ POST_CATCH_DELAY    = 2.800       # 钓鱼结束/失败后等待(秒), 收杆→
 SHAKE_HEAD_TIME     = 0.0300      # 摇头每段按住时长(秒)
 INITIAL_PRESS_TIME  = 0.2         # 开局按压时长(秒)
 SUCCESS_PROGRESS    = 0.42        # 进度条 > 此值判定钓鱼成功 (0~1)
-MINIGAME_TIMEOUT    = 120.0       # 小游戏最长持续时间 (秒), 超过强制结束
+MINIGAME_TIMEOUT    = 240.0       # 小游戏最长持续时间 (秒), 超过强制结束
 UI_CHECK_FRAMES     = 5           # 每N帧检查一次轨道是否还在 (15→30, 降低检查频率)
 UI_GONE_LIMIT       = 2            # 连续N次轨道检查失败 → 判定游戏结束 (2→4)
 SUCCESS_CLICK_DELAY = 0.5
-POST_RELEASE_DELAY = 0
+POST_RELEASE_DELAY = 0.5
 
 
 ENABLE_SECTION_HEAD_ADJUST = True
 HEAD_ADJUST_FAIL_THRESHOLD = 5
 HEAD_ADJUST_SUCCESS_THRESHOLD = 3
-HEAD_ADJUST_STEP_SEC = 0.15
+HEAD_ADJUST_STEP_SEC = 0.08
 
 # ═══════════════════════════════════════════════════════════
 #  模板匹配置信度阈值
@@ -160,7 +160,7 @@ IL_STRONG_PRESS = 0.68        # model がこれ以上なら押し寄りで上書
 IL_STRONG_RELEASE = 0.32      # model がこれ以下なら離し寄りで上書き
 
 # Adaptive PD / RL
-ADAPTIVE_PD_ENABLE_RL = True
+ADAPTIVE_PD_ENABLE_RL = False
 ADAPTIVE_PD_ACTION_GAIN = 0.15
 ADAPTIVE_PD_SCALE_MIN = 0.85
 ADAPTIVE_PD_SCALE_MAX = 1.15
