@@ -354,6 +354,7 @@ class FishingBot:
         self._rl_prev_state = None
         self._rl_prev_progress = 0.0
         self._rl_prev_abs_error = None
+        self._rl_prev_delta_hold = 0.0
         self._rl_episode_reward = 0.0
         self._rl_step_reward_sum = 0.0      # 途中報酬の合計
         self._rl_terminal_reward = 0.0      # 最終報酬
@@ -1103,6 +1104,7 @@ class FishingBot:
         self._rl_prev_state = None
         self._rl_prev_progress = 0.0
         self._rl_prev_abs_error = None
+        self._rl_prev_delta_hold = 0.0
         self._rl_episode_reward = 0.0
         self._rl_step_reward_sum = 0.0
         self._rl_terminal_reward = 0.0
@@ -2061,9 +2063,9 @@ class FishingBot:
             # ── RL終端学習 ──
             if self._rl is not None:
                 terminal_reward = (
-                    getattr(config, "RL_SUCCESS_REWARD", 2.5)
+                    getattr(config, "RL_SUCCESS_REWARD", 4.0)
                     if success else
-                    getattr(config, "RL_FAIL_REWARD", -2.5)
+                    getattr(config, "RL_FAIL_REWARD", -4.0)
                 )
                 self._rl_terminal_reward = terminal_reward
                 self._rl_episode_reward += terminal_reward
@@ -2875,34 +2877,46 @@ class FishingBot:
             self._bin(progress,       0.0, 1.0, getattr(config, "RL_PROG_BIN", 8)),
         )
 
-    def _calc_rl_step_reward(self, *, abs_error, fish_in_bar, progress, prev_abs_error):
+    def _calc_rl_step_reward(
+        self,
+        *,
+        abs_error,
+        fish_in_bar,
+        progress,
+        prev_abs_error,
+        prev_delta_hold=0.0,
+    ):
         reward = 0.0
 
-        # バー内維持
-        if 0.0 <= fish_in_bar <= 1.0:
-            reward += getattr(config, "RL_REWARD_IN_BAR", 0.06)
-        else:
-            reward += getattr(config, "RL_REWARD_OUTSIDE", -0.04)
+        # 1) 生存ボーナス
+        reward += getattr(config, "RL_REWARD_ALIVE", 0.01)
 
-        # 中央へ寄ったら加点、離れたら減点
+        # 2) バー内位置の形状報酬
+        # fish_in_bar: 0.0=上端, 0.5=中央, 1.0=下端
+        if 0.0 <= fish_in_bar <= 1.0:
+            center_err = abs(fish_in_bar - 0.5) / 0.5   # 0~1
+            reward += getattr(config, "RL_REWARD_CENTER_SHAPE", 0.10) * (1.0 - center_err)
+            reward += getattr(config, "RL_REWARD_IN_BAR", 0.03)
+        else:
+            outside = min(abs(fish_in_bar - 0.5), 1.5)
+            reward -= getattr(config, "RL_REWARD_OUTSIDE_SCALE", 0.08) * outside
+
+        # 3) 前フレームより改善したか
         if prev_abs_error is not None:
             improve = prev_abs_error - abs_error
-            reward += improve * getattr(config, "RL_REWARD_CENTER_GAIN", 0.10) / 50.0
+            improve = max(-20.0, min(20.0, improve))  # クリップ
+            reward += improve * getattr(config, "RL_REWARD_IMPROVE_GAIN", 0.01)
 
-        # progress 上昇/下降の差分報酬
+        # 4) progress差分は弱めに使う
         dprog = progress - self._rl_prev_progress
-        if dprog > 0:
-            reward += dprog * getattr(config, "RL_REWARD_PROGRESS_UP", 0.80)
-        elif dprog < 0:
-            reward += dprog * getattr(config, "RL_REWARD_PROGRESS_DOWN", 0.35)
+        dprog = max(-0.05, min(0.05, dprog))  # ノイズ抑制
+        reward += dprog * getattr(config, "RL_REWARD_PROGRESS_GAIN", 0.25)
 
-        # 高進捗帯の継続ボーナス
-        if progress >= getattr(config, "RL_PROGRESS_HIGH_TH", 0.85):
-            reward += getattr(config, "RL_REWARD_PROGRESS_HIGH", 0.05)
-        elif progress >= getattr(config, "RL_PROGRESS_MID_TH", 0.60):
-            reward += getattr(config, "RL_REWARD_PROGRESS_MID", 0.02)
+        # 5) 補正量が大きすぎる行動を少し抑制
+        reward -= abs(prev_delta_hold) * getattr(config, "RL_REWARD_ACTION_PENALTY", 0.8)
 
         return float(reward)
+    
     def _control_mouse(self, fish, bar, sr) -> bool:
         """
         高品質PD + residual RL
@@ -2989,6 +3003,7 @@ class FishingBot:
                     fish_in_bar=fish_in_bar,
                     progress=self._pd_last_progress,
                     prev_abs_error=self._rl_prev_abs_error,
+                    prev_delta_hold=self._rl_prev_delta_hold,
                 )
                 self._rl_episode_reward += step_reward
                 self._rl_step_reward_sum += step_reward
@@ -2997,13 +3012,17 @@ class FishingBot:
                 # 今回の補正量を選ぶ
                 delta_hold, _ = self._rl.act(state)
 
-                # 安全のため補正幅は base_hold 依存で少し制限してもよい
+                # 補正幅を少し制限（PD補正として暴れにくくする）
+                max_delta = getattr(config, "RL_MAX_DELTA_HOLD", 0.020)
+                delta_hold = max(-max_delta, min(max_delta, delta_hold))
+
                 final_hold = base_hold + delta_hold
                 final_hold = max(MIN_HOLD, min(final_hold, MAX_HOLD))
 
                 self._rl_prev_state = state
                 self._rl_prev_progress = self._pd_last_progress
                 self._rl_prev_abs_error = abs_error_px
+                self._rl_prev_delta_hold = delta_hold
 
                 # ステップ報酬ログ（出しすぎ防止で30フレームごと）
                 if getattr(config, "RL_LOG_STEP_REWARD", True):
@@ -3017,7 +3036,8 @@ class FishingBot:
                             f"sum={self._rl_step_reward_sum:+.4f} "
                             f"err_px={bar_cy - fish_cy:+.1f} "
                             f"fib={fish_in_bar:.3f} "
-                            f"prog={self._pd_last_progress:.1%}"
+                            f"prog={self._pd_last_progress:.1%} "
+                            f"prev_d={self._rl_prev_delta_hold*1000:+.1f}ms"
                         )
 
             action_press = 1 if final_hold >= MIN_HOLD + 0.001 else 0
