@@ -218,6 +218,8 @@ class FishingBot:
         self._rl_prev_progress = 0.0
         self._rl_prev_abs_error = None
         self._rl_episode_reward = 0.0
+        self._rl_step_reward_sum = 0.0      # 途中報酬の合計
+        self._rl_terminal_reward = 0.0      # 最終報酬
 
         # ── Debug overlay（別スレッド描画。釣り処理を止めない） ──
         self._last_overlay_time = 0
@@ -243,10 +245,9 @@ class FishingBot:
         self._bar_locked_cx  = None      # ★ 軌道X軸ロック（白バーと魚で共有）
         self._pool = ThreadPoolExecutor(max_workers=2)
 
-        # ── セクション単位の頭向き補正状態 ──
-        self._section_fail_streak = 0
-        self._section_success_streak = 0
-        self._section_head_adjust_active = False
+        # ── 未検出ベースの頭向き補正状態 ──
+        self._no_minigame_streak = 0
+        self._no_minigame_adjust_active = False
 
         # ── 行動クローニング（Imitation Learning） ──
         self._il_history = deque(maxlen=config.IL_HISTORY_LEN)
@@ -654,71 +655,50 @@ class FishingBot:
 
     # ───────────────── 頭向き補正の更新 ──────────────────
 
-    def _update_section_head_adjust(self, result: bool):
+    def _update_section_head_adjust(self, no_minigame: bool):
         """
-        長期間失敗時の頭向き補正。
+        連続未検出ベースの頭向き補正。
 
         仕様:
-        - 連続失敗が閾値以上で補正モード開始
-        - 補正モード中は、成功/失敗に関係なく毎セクション右へ step_sec
-        - 成功したセクションだけ success_count を加算
-        - success_count が閾値以上になったら、左へ step_sec を2回送って終了
+        - _verify_minigame() が False のときだけ「未検出」と数える
+        - 未検出が閾値以上になったら補正モード開始
+        - 補正モード中は、未検出のたびに毎回左へ step_sec 回す
+        - 一度でもミニゲーム検出できたら streak をリセットし、補正モード終了
         """
         if not getattr(config, "ENABLE_SECTION_HEAD_ADJUST", False):
             return
 
         step_sec = getattr(config, "HEAD_ADJUST_STEP_SEC", 0.3)
-        fail_th = getattr(config, "HEAD_ADJUST_FAIL_THRESHOLD", 5)
-        success_th = getattr(config, "HEAD_ADJUST_SUCCESS_THRESHOLD", 3)
+        detect_fail_th = getattr(config, "HEAD_ADJUST_FAIL_THRESHOLD", 10)
 
-        # ── 補正モード前 ──
-        if not self._section_head_adjust_active:
-            if result:
-                self._section_fail_streak = 0
-                return
-
-            # 失敗（未検出も含む）
-            self._section_fail_streak += 1
+        if no_minigame:
+            self._no_minigame_streak += 1
             log.info(
-                f"[頭向き補正] 失敗カウント "
-                f"{self._section_fail_streak}/{fail_th}"
+                f"[頭向き補正] 未検出カウント "
+                f"{self._no_minigame_streak}/{detect_fail_th}"
             )
 
-            if self._section_fail_streak < fail_th:
-                return
+            if self._no_minigame_streak >= detect_fail_th:
+                if not self._no_minigame_adjust_active:
+                    self._no_minigame_adjust_active = True
+                    log.warning(
+                        f"[頭向き補正] 連続未検出 "
+                        f"{self._no_minigame_streak}/{detect_fail_th} に到達。"
+                        f"以後、未検出のたびに左補正します"
+                    )
 
-            # 閾値到達で補正開始
-            self._section_head_adjust_active = True
-            self._section_success_streak = 0
-            log.warning(
-                f"[頭向き補正] 連続失敗 {self._section_fail_streak}/{fail_th} に到達。補正開始"
-            )
-
-        # ── 補正モード中 ──
-        # 成功 / 失敗に関係なく毎セクション右へ補正
-        log.info(f"[頭向き補正] 右へ {step_sec:.1f}s 補正を入れます")
-        self.input.look_right_for(step_sec)
-
-        if result:
-            self._section_success_streak += 1
-            log.info(
-                f"[頭向き補正] 成功カウント "
-                f"{self._section_success_streak}/{success_th}"
-            )
-
-            if self._section_success_streak >= success_th:
-                log.info(
-                    f"[頭向き補正] 成功しきい値到達。"
-                    f"左へ {step_sec:.1f}s を2回送って補正終了"
-                )
-                self.input.look_left_for(step_sec)
+                log.info(f"[頭向き補正] 左へ {step_sec:.1f}s 補正を入れます")
                 self.input.look_left_for(step_sec)
 
-                self._section_head_adjust_active = False
-                self._section_success_streak = 0
-                self._section_fail_streak = 0
         else:
-            log.info("[頭向き補正] 失敗したが、成功カウントは維持して継続")
+            if self._no_minigame_streak > 0 or self._no_minigame_adjust_active:
+                log.info(
+                    f"[頭向き補正] ミニゲーム検出を確認。"
+                    f"未検出カウント {self._no_minigame_streak} をリセットします"
+                )
+
+            self._no_minigame_streak = 0
+            self._no_minigame_adjust_active = False
 
     # ══════════════════════════════════════════════════════
     #  第2段階: 食いつきを待つ
@@ -976,6 +956,8 @@ class FishingBot:
         self._rl_prev_progress = 0.0
         self._rl_prev_abs_error = None
         self._rl_episode_reward = 0.0
+        self._rl_step_reward_sum = 0.0
+        self._rl_terminal_reward = 0.0
 
         # ── PD教師データ収集状態を毎回リセット ──
         if config.PD_RECORD and (not config.IL_RECORD) and (not config.IL_USE_MODEL):
@@ -1126,13 +1108,13 @@ class FishingBot:
         _prev_green = 0.0
 
         # ── 成功判定用: 終了直前60フレームの進捗履歴 ──
-        green_history = deque(maxlen=20)
+        green_history = deque(maxlen=30)
 
-        # ── 直前5フレーム補完用バッファ ──
-        recent_fish = deque(maxlen=5)
-        recent_bar = deque(maxlen=5)
-        recent_progress = deque(maxlen=5)
-        recent_hook = deque(maxlen=5)
+        # ── 直前10フレーム補完用バッファ ──
+        recent_fish = deque(maxlen=10)
+        recent_bar = deque(maxlen=10)
+        recent_progress = deque(maxlen=10)
+        recent_hook = deque(maxlen=10)
 
         def _push_recent(buf, value, frame_no):
             """補完用履歴バッファに追加する"""
@@ -1540,26 +1522,26 @@ class FishingBot:
                         fish = None
                         bar = None
 
-                # ════════════ 直前5フレーム補完 ════════════
+                # ════════════ 直前10フレーム補完 ════════════
                 if fish is None:
                     fish = _get_recent(recent_fish, frame, max_age=5)
                     if fish is not None and frame % 10 == 1:
-                        log.info("  ↺ 魚を直前5フレーム履歴で補完しました")
+                        log.info("  ↺ 魚を直前10フレーム履歴で補完しました")
 
                 if bar is None:
                     bar = _get_recent(recent_bar, frame, max_age=5)
                     if bar is not None and frame % 10 == 1:
-                        log.info("  ↺ 白バーを直前5フレーム履歴で補完しました")
+                        log.info("  ↺ 白バーを直前10フレーム履歴で補完しました")
 
                 if _yolo_progress is None:
                     _yolo_progress = _get_recent(recent_progress, frame, max_age=5)
                     if _yolo_progress is not None and frame % 10 == 1:
-                        log.info("  ↺ 進捗バーを直前5フレーム履歴で補完しました")
+                        log.info("  ↺ 進捗バーを直前10フレーム履歴で補完しました")
 
                 if _yolo_hook is None:
                     _yolo_hook = _get_recent(recent_hook, frame, max_age=5)
                     if _yolo_hook is not None and frame % 10 == 1:
-                        log.info("  ↺ hookを直前5フレーム履歴で補完しました")
+                        log.info("  ↺ hookを直前10フレーム履歴で補完しました")
 
                 # 最終観測保持（教師データ記録用）
                 if fish is not None:
@@ -1888,30 +1870,45 @@ class FishingBot:
         finally:
             log.info(f"[END_REASON] {end_reason}")
 
-            # ── 最終成功判定 ──
-            # 直前数十フレームの平均進捗で成功 / 失敗を決める
+            # ── progress履歴取得 ──
             last_values = list(green_history)
-            avg_green = sum(last_values) / len(last_values) if last_values else 0.0
 
+            if last_values:
+                # ★ 最後40%のフレームを切り捨て
+                cut = int(len(last_values) * 0.4)
+                trimmed = last_values[:-cut] if cut > 0 else last_values
+
+                avg_green = sum(trimmed) / len(trimmed)
+                max_green = max(trimmed)
+
+                # デバッグログ
+                progress_log = ", ".join(f"{v:.1%}" for v in trimmed)
+                log.info(
+                    f"[PROGRESS_HISTORY] total={len(last_values)} "
+                    f"used={len(trimmed)} cut={cut} | [{progress_log}]"
+                )
+            else:
+                avg_green = 0.0
+                max_green = 0.0
+                log.info("[PROGRESS_HISTORY] frames=0")
+
+            # ── 成功判定 ──
             if _skip_fish:
                 success = False
                 log.info(
-                    f"[⏭ スキップ] 対象外の魚なので放棄しました "
-                    f"(avg={avg_green:.0%}, max={_last_green:.0%} は無効)"
+                    f"[⏭ スキップ] 対象外の魚 (avg={avg_green:.0%}, max={max_green:.0%})"
                 )
             elif avg_green > config.SUCCESS_PROGRESS:
                 success = True
                 log.info(
-                    f"[✅ 成功] 直前{len(last_values)}フレーム平均 {avg_green:.0%} > "
-                    f"{config.SUCCESS_PROGRESS:.0%} のため成功判定 "
-                    f"(max={_last_green:.0%})"
+                    f"[✅ 成功] avg {avg_green:.0%} > {config.SUCCESS_PROGRESS:.0%} "
+                    f"(max={max_green:.0%})"
                 )
             else:
                 success = False
                 log.info(
-                    f"[❌ 失敗] 直前{len(last_values)}フレーム平均 {avg_green:.0%} <= "
-                    f"{config.SUCCESS_PROGRESS:.0%} のため失敗判定 "
-                    f"(max={_last_green:.0%})"
+                    f"[❌ 失敗] avg {avg_green:.0%} <= {config.SUCCESS_PROGRESS:.0%} "
+                    f"(max={max_green:.0%})"
                 )
                         # ── RL終端学習 ──
             if self._rl is not None:
@@ -1920,15 +1917,22 @@ class FishingBot:
                     if success else
                     getattr(config, "RL_FAIL_REWARD", -2.5)
                 )
+                self._rl_terminal_reward = terminal_reward
                 self._rl_episode_reward += terminal_reward
 
-                dummy_next_state = self._rl_prev_state if self._rl_prev_state is not None else (0, 0, 0, 0, 0, 0)
+                dummy_next_state = (
+                    self._rl_prev_state
+                    if self._rl_prev_state is not None
+                    else (0, 0, 0, 0, 0, 0)
+                )
                 self._rl.update(terminal_reward, dummy_next_state, done=True)
                 self._rl.save()
 
                 log.info(
-                    f"[RL] episode_reward={self._rl_episode_reward:+.3f} "
-                    f"terminal={terminal_reward:+.2f}"
+                    f"[RL_END] step_sum={self._rl_step_reward_sum:+.4f} "
+                    f"terminal={self._rl_terminal_reward:+.4f} "
+                    f"total={self._rl_episode_reward:+.4f} "
+                    f"success={success} end_reason={end_reason}"
                 )
             # PD教師データのエピソード終端記録
             if config.PD_RECORD and (not config.IL_RECORD) and (not config.IL_USE_MODEL):
@@ -2831,6 +2835,7 @@ class FishingBot:
                     prev_abs_error=self._rl_prev_abs_error,
                 )
                 self._rl_episode_reward += step_reward
+                self._rl_step_reward_sum += step_reward
                 self._rl.update(step_reward, state, done=False)
 
                 # 今回の補正量を選ぶ
@@ -2843,6 +2848,21 @@ class FishingBot:
                 self._rl_prev_state = state
                 self._rl_prev_progress = self._pd_last_progress
                 self._rl_prev_abs_error = abs_error_px
+
+                # ステップ報酬ログ（出しすぎ防止で30フレームごと）
+                if getattr(config, "RL_LOG_STEP_REWARD", True):
+                    if not hasattr(self, "_rl_log_step_counter"):
+                        self._rl_log_step_counter = 0
+                    self._rl_log_step_counter += 1
+
+                    if self._rl_log_step_counter % getattr(config, "RL_LOG_STEP_INTERVAL", 30) == 0:
+                        log.info(
+                            f"[RL_STEP] r={step_reward:+.4f} "
+                            f"sum={self._rl_step_reward_sum:+.4f} "
+                            f"err_px={bar_cy - fish_cy:+.1f} "
+                            f"fib={fish_in_bar:.3f} "
+                            f"prog={self._pd_last_progress:.1%}"
+                        )
 
             action_press = 1 if final_hold >= MIN_HOLD + 0.001 else 0
             control_value = float(final_hold)
@@ -2972,8 +2992,8 @@ class FishingBot:
                         self.fish_count += 1
                         self.fail_count += 1
 
-                        # 頭向き補正更新
-                        self._update_section_head_adjust(result)
+                        # 未検出ベースで頭向き補正更新
+                        self._update_section_head_adjust(True)
 
                         log.info(
                             f"[🎣 結果] 第 {self.fish_count} 回釣り — 未検出 ❌ "
@@ -2983,6 +3003,9 @@ class FishingBot:
                         continue
                     else:
                         self._retry_no_minigame_count = 0
+
+                        # 検出できたので未検出連続をリセット
+                        self._update_section_head_adjust(False)
 
                 if not self.running:
                     break
@@ -3003,7 +3026,6 @@ class FishingBot:
                     f"(累計: 成功{self.success_count}/失敗{self.fail_count})"
                 )
 
-                self._update_section_head_adjust(result)
                 log.info("─" * 40)
 
                 self.state = "次のループ待機"

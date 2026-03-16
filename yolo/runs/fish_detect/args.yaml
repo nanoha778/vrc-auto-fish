@@ -5,7 +5,7 @@ data: D:\GitHub\vrc-auto-fish\yolo\dataset\data.yaml
 epochs: 80
 time: null
 patience: 20
-batch: 16
+batch: 24
 imgsz: 960
 save: true
 save_period: 10

@@ -1,14 +1,14 @@
 """
-全局配置模块
-============
-所有可调参数集中管理。
+グローバル設定モジュール
+========================
+すべての調整可能パラメータをここで一元管理する。
 """
 
 import os
 import sys
 
 # ═══════════════════════════════════════════════════════════
-#  路径
+#  パス
 # ═══════════════════════════════════════════════════════════
 if getattr(sys, 'frozen', False):
     BASE_DIR = sys._MEIPASS
@@ -20,51 +20,50 @@ DEBUG_DIR = os.path.join(_APP_DIR, "debug")
 SETTINGS_FILE = os.path.join(_APP_DIR, "settings.json")
 
 # ═══════════════════════════════════════════════════════════
-#  VRChat 窗口
+#  VRChat ウィンドウ
 # ═══════════════════════════════════════════════════════════
 WINDOW_TITLE = "VRChat"
 
 # ═══════════════════════════════════════════════════════════
-#  快捷键 (VRChat 内也可用)
+#  ホットキー（VRChat内でも使用可能）
 # ═══════════════════════════════════════════════════════════
 HOTKEY_TOGGLE = "F9"
 HOTKEY_STOP   = "F10"
 HOTKEY_DEBUG  = "F11"
 
 # ═══════════════════════════════════════════════════════════
-#  时间参数（秒）
+#  時間パラメータ（秒）
 # ═══════════════════════════════════════════════════════════
-CAST_DELAY          = 1.0         # 抛竿后等待
-BITE_TIMEOUT        = 60.0        # 最长等鱼时间 (绝对上限)
-BITE_FORCE_HOOK     = 0.500       # N秒无咬钩 → 强制提竿进入小游戏 (防漏检)
-BITE_CHECK_INTERVAL = 0.15        # 咬钩检测间隔
-MIN_BITE_WAIT       = 1.0         # 最少等待N秒才开始检测咬钩（防止误检）
-COLOR_BITE_WAIT     = 6.0         # N秒后才启用颜色检测（模板优先）
-COLOR_BITE_PIXELS   = 500         # 颜色检测最少像素数（越高越严格）
-HOOK_PRE_DELAY      = 0.1         # 提竿前延迟 (★ 0.2→0.1)
-HOOK_POST_DELAY     = 0.4         # 提竿后等待 UI 出现 (★ 0.3→0.4)
-VERIFY_TIMEOUT      = 1.0         # 提竿后验证小游戏出现的超时(秒)
-VERIFY_CONSECUTIVE  = 1           # ★ 累计N帧检测到白条+轨道即确认
-GAME_LOOP_INTERVAL  = 0.005       # 小游戏循环间隔 (60FPS游戏, 尽量快)
-SHOW_DEBUG             = True     # 是否显示debug窗口 (关闭可提升性能)
-DEBUG_OVERLAY_INTERVAL = 0.033    # debug窗口最小刷新间隔(秒) ~30FPS
-DEBUG_OVERLAY_MAX_W    = 1920  # debug窗口最大宽度(像素)
-DEBUG_OVERLAY_MAX_H    = 1080      # debug窗口最大高度(像素)
-TRACK_LOST_LIMIT    = 60           # 连续N帧鱼+条都没了 → 游戏结束 (15→60, 约3-4秒容忍)
-FISH_LOST_LIMIT     = 120          # 连续N帧鱼消失 → 游戏可能结束
-SINGLE_OBJ_TIMEOUT  = 5.0         # ★ 鱼或条单独消失超过N秒 → 判定失败收杆 (3→5)
-OBJ_MIN_COUNT       = 1            # ★ 每帧至少检测到N个对象才继续 (2→1, 只要鱼或条任一即可)
-OBJ_GONE_LIMIT      = 80           # ★ 连续N帧对象不足 → 游戏结束 (25→80)
-POST_CATCH_DELAY    = 2.800       # 钓鱼结束/失败后等待(秒), 收杆→等待→摇头→抛竿
-SHAKE_HEAD_TIME     = 0.0300      # 摇头每段按住时长(秒)
-INITIAL_PRESS_TIME  = 0.2         # 开局按压时长(秒)
-SUCCESS_PROGRESS    = 0.42        # 进度条 > 此值判定钓鱼成功 (0~1)
-MINIGAME_TIMEOUT    = 120.0       # 小游戏最长持续时间 (秒), 超过强制结束
-UI_CHECK_FRAMES     = 5           # 每N帧检查一次轨道是否还在 (15→30, 降低检查频率)
-UI_GONE_LIMIT       = 2            # 连续N次轨道检查失败 → 判定游戏结束 (2→4)
-SUCCESS_CLICK_DELAY = 0.2
-POST_RELEASE_DELAY = 0.5
-
+CAST_DELAY          = 1.0         # 投竿後の待機
+BITE_TIMEOUT        = 60.0        # 最大待機時間（絶対上限）
+BITE_FORCE_HOOK     = 0.500       # N秒間ヒットなし → 強制的に合わせてミニゲームへ（検出漏れ対策）
+BITE_CHECK_INTERVAL = 0.15        # ヒット判定のチェック間隔
+MIN_BITE_WAIT       = 1.0         # 最低N秒待ってからヒット検出開始（誤検出防止）
+COLOR_BITE_WAIT     = 6.0         # N秒後に色検出を有効化（テンプレート優先）
+COLOR_BITE_PIXELS   = 500         # 色検出の最小ピクセル数（高いほど厳しい）
+HOOK_PRE_DELAY      = 0.1         # 合わせ前の遅延
+HOOK_POST_DELAY     = 0.4         # 合わせ後 UI 出現待機
+VERIFY_TIMEOUT      = 1.0         # ミニゲームUI出現確認のタイムアウト
+VERIFY_CONSECUTIVE  = 1           # 連続Nフレーム検出で確定
+GAME_LOOP_INTERVAL  = 0.005       # ミニゲームループ間隔（できるだけ高速）
+SHOW_DEBUG             = True     # debugウィンドウ表示（OFFで高速化）
+DEBUG_OVERLAY_INTERVAL = 0.033    # debugウィンドウ更新間隔
+DEBUG_OVERLAY_MAX_W    = 1920     # debug最大幅
+DEBUG_OVERLAY_MAX_H    = 1080     # debug最大高さ
+TRACK_LOST_LIMIT    = 20          # Nフレーム魚＋バー消失 → ゲーム終了
+FISH_LOST_LIMIT     = 60          # 魚がNフレーム消失 → 終了の可能性
+SINGLE_OBJ_TIMEOUT  = 5.0         # 魚またはバー単独消失 N秒 → 失敗
+OBJ_MIN_COUNT       = 1           # 1オブジェクト以上検出で継続
+OBJ_GONE_LIMIT      = 80          # オブジェクト不足Nフレーム → 終了
+POST_CATCH_DELAY    = 2.800       # 釣り終了後の待機
+SHAKE_HEAD_TIME     = 0.0300      # 首振り時間
+INITIAL_PRESS_TIME  = 0.2         # 開始時押下時間
+SUCCESS_PROGRESS    = 0.42        # この進捗以上で成功判定
+MINIGAME_TIMEOUT    = 480.0       # ミニゲーム最大時間
+UI_CHECK_FRAMES     = 10          # NフレームごとにUI確認
+UI_GONE_LIMIT       = 1           # UI消失N回で終了
+SUCCESS_CLICK_DELAY = 0.5         # 成功後クリックまでの待機
+POST_RELEASE_DELAY  = 0.3         # 竿を放してから次の行動までの待機 
 
 ENABLE_SECTION_HEAD_ADJUST = True
 HEAD_ADJUST_FAIL_THRESHOLD = 10
@@ -72,86 +71,87 @@ HEAD_ADJUST_SUCCESS_THRESHOLD = 3
 HEAD_ADJUST_STEP_SEC = 0.1
 
 # ═══════════════════════════════════════════════════════════
-#  模板匹配置信度阈值
-#  ★ ROI 框选后搜索范围极小, 误匹配风险很低, 阈值可大幅放宽
-#    真实鱼: 0.61~0.82    真实白条: 0.84~0.89    真实轨道: 0.51~0.57
+#  テンプレートマッチング信頼度
+#  ★ ROI限定検索なので誤検出リスクが低い
 # ═══════════════════════════════════════════════════════════
 THRESH_BITE     = 0.50
-THRESH_FISH     = 0.35           # ★ 0.50→0.35 (ROI内极少误匹配, 大幅放宽)
-THRESH_BAR      = 0.40           # ★ 0.62→0.40 (实测0.84+, 大幅放宽防漏检)
+THRESH_FISH     = 0.35
+THRESH_BAR      = 0.40
 THRESH_HOOK     = 0.45
-THRESH_TRACK    = 0.35           # ★ 0.48→0.35 (ROI内无干扰, 大幅放宽)
+THRESH_TRACK    = 0.35
 
 # ═══════════════════════════════════════════════════════════
-#  多尺度匹配
+#  マルチスケールマッチング
 # ═══════════════════════════════════════════════════════════
-# 通用缩放 (轨道检测)
+# 軌道検出スケール
 MATCH_SCALES = [0.7, 1.0, 1.5, 2.0, 3.0]
-# 白条缩放
+
+# 白バー検出スケール
 BAR_SCALES   = [0.7, 1.0, 1.5, 2.0, 3.0]
-# ★ 游戏内鱼图标的大致像素大小 (用户可在GUI调节)
-#   系统会根据 模板尺寸 / FISH_GAME_SIZE 自动计算最佳缩放比例
-#   例: 模板38px, 游戏鱼20px → 最佳scale=1.9, 搜索范围 1.1~2.7
+
+# ★ ゲーム内の魚アイコンの推定サイズ
+#   テンプレートサイズ / FISH_GAME_SIZE から最適スケールを計算
 FISH_GAME_SIZE = 30
 
 # ═══════════════════════════════════════════════════════════
-#  小游戏控制
+#  ミニゲーム制御
 # ═══════════════════════════════════════════════════════════
-# ── PD 控制器参数 (适配高惯性钓鱼) ──
-DEAD_ZONE       = 12              # 固定死区(px), 备用 (动态死区优先)
-DEAD_ZONE_RATIO = 0.22            # 动态死区: 白条高度 × 此比例 (鱼在白条中心此范围内=居中)
-MAINTAIN_TAP_S  = 0.006           # 死区内维持性短按时长(秒), 抵消重力防坠底
-HOLD_MIN_S      = 0.015           # 抗重力基准 (秒) — 越小下降越快
-HOLD_MAX_S      = 0.120           # 单次最长按住 (秒)
-HOLD_GAIN       = 0.055           # 位置增益: 误差×增益=额外按住时长
-VELOCITY_SMOOTH = 0.3             # 速度低通滤波系数 (0~1, 越大越平滑)
-PREDICT_AHEAD   = 0.22            # 前瞻时间 (秒) — 高惯性系统需要更远的预判
-SPEED_DAMPING   = 0.00025         # 速度阻尼: 下坠快时加按住, 上升快时减按住
-MAX_FISH_BAR_DIST = 300           # ★ 鱼和白条中心最大合理距离(px), 超过视为误检
-REGION_UP         = 300           # 白条锁定后, 向上搜索像素数
-REGION_DOWN       = 400           # 白条锁定后, 向下搜索像素数
-REGION_X          = 100           # 白条锁定后, 左右搜索像素数 (中心±N)
-USE_OSC           = True           # True=OSC输入(不占鼠标), False=PostMessage输入
-DETECT_ROI        = None           # 玩家框选的检测区域 [x, y, w, h], None=全屏搜索
+# ── PD制御パラメータ（高慣性釣り向け）──
+DEAD_ZONE       = 12
+DEAD_ZONE_RATIO = 0.22
+MAINTAIN_TAP_S  = 0.006
+HOLD_MIN_S      = 0.015
+HOLD_MAX_S      = 0.120
+HOLD_GAIN       = 0.055
+VELOCITY_SMOOTH = 0.3
+PREDICT_AHEAD   = 0.22
+SPEED_DAMPING   = 0.00025
+MAX_FISH_BAR_DIST = 300
+REGION_UP         = 300
+REGION_DOWN       = 400
+REGION_X          = 100
+USE_OSC           = True
+DETECT_ROI        = None
 
 # ═══════════════════════════════════════════════════════════
-#  安全保护功能
+#  安全保護
 # ═══════════════════════════════════════════════════════════
-PAUSE_ON_MOUSE_ZERO = False          # True=检测到鼠标在(0,0)坐标时自动暂停钓鱼线程
+PAUSE_ON_MOUSE_ZERO = False
 
 # ═══════════════════════════════════════════════════════════
-#  强制重置功能 (连续未检测到小游戏)
+#  強制リセット
 # ═══════════════════════════════════════════════════════════
-ENABLE_FORCE_RESET = False            # True=启用强制重置功能
-MAX_RETRY_NO_MINIGAME = 3            # 连续N次未检测到小游戏则强制重置
-FORCE_RESET_DELAY = 15.0             # 强制重置等待时间(秒), 等待游戏自动重置
+ENABLE_FORCE_RESET = False
+MAX_RETRY_NO_MINIGAME = 0
+FORCE_RESET_DELAY = 15.0
 
 # ═══════════════════════════════════════════════════════════
-#  界面语言设置 (zh/en/jp)
+#  UI言語設定
 # ═══════════════════════════════════════════════════════════
-LANGUAGE = "jp"                      # 界面语言: zh=中文, en=English, jp=日本語
+LANGUAGE = "jp"
 
 # ═══════════════════════════════════════════════════════════
-#  YOLO 目标检测 (替代模板匹配, 需训练后使用)
+#  YOLO物体検出（テンプレートの代替）
 # ═══════════════════════════════════════════════════════════
 USE_YOLO      = True
 YOLO_MODEL    = os.path.join(BASE_DIR, "yolo", "runs", "fish_detect", "weights", "best.pt")
-YOLO_CONF     = 0.25              # YOLO 检测置信度阈值
-YOLO_DEVICE   = "auto"            # "auto" 优先GPU / "cpu" 强制CPU / "gpu" 强制GPU
-YOLO_COLLECT  = True             # True=钓鱼时自动保存截图用于训练
-YOLO_COLLECT_ON_FAIL = False      # True=仅在钓鱼失败时采集图像（独立开关，无需开启YOLO_COLLECT）
-TRACK_MIN_ANGLE   = 3.0           # 轨道倾斜角度阈值(度), 超过此值启用旋转补偿
-TRACK_MAX_ANGLE   = 45.0          # 轨道最大合理角度(度), 超过视为误检(如把海平线当轨道)
+YOLO_CONF     = 0.25
+YOLO_DEVICE   = "auto"
+YOLO_COLLECT  = True
+YOLO_COLLECT_ON_FAIL = False
+TRACK_MIN_ANGLE   = 3.0
+TRACK_MAX_ANGLE   = 45.0
 
 # ═══════════════════════════════════════════════════════════
-#  行为克隆 (录制你的操作 → 训练模型 → 替代PD控制器)
+#  行動模倣学習（Behavior Cloning）
 # ═══════════════════════════════════════════════════════════
-IL_RECORD       = False           # True=录制模式: 检测位置但不控制鼠标, 记录你的操作
-IL_USE_MODEL    = False           # True=用训练好的模型控制, False=PD控制器
+IL_RECORD       = False
+IL_USE_MODEL    = False
 IL_MODEL_PATH   = os.path.join(BASE_DIR, "imitation", "policy.pt")
 IL_DATA_DIR     = os.path.join(BASE_DIR, "imitation", "data")
-IL_HISTORY_LEN  = 10              # 输入历史帧数 (捕捉鱼的运动模式)
-IL_PRESS_THRESH = 0.50            # 按住阈值: 模型概率 > 此值才按住 (默认0.5, 按太久就调高)
+IL_HISTORY_LEN  = 10
+IL_PRESS_THRESH = 0.50
+
 
 # ── RL residual hold tuning ──
 RL_ENABLE = True
@@ -164,22 +164,25 @@ RL_GAMMA = 0.96
 RL_HOLD_ACTIONS = [-0.015, -0.008, 0.0, 0.008, 0.015]
 
 # 終端報酬
-RL_SUCCESS_REWARD = 2.5
-RL_FAIL_REWARD = -2.5
+RL_SUCCESS_REWARD = 3.5
+RL_FAIL_REWARD = -3.0
 
 # ステップ報酬
-RL_REWARD_IN_BAR = 0.06
-RL_REWARD_CENTER_GAIN = 0.10
-RL_REWARD_PROGRESS_GAIN = 0.20
-RL_REWARD_OUTSIDE = -0.04
+RL_REWARD_IN_BAR = 0.05
+RL_REWARD_CENTER_GAIN = 0.06
+RL_REWARD_PROGRESS_GAIN = 0.10
+RL_REWARD_OUTSIDE = -0.05
 
 # 離散化
-RL_ERR_BIN = 12
-RL_VEL_BIN = 8
-RL_FISHDELTA_BIN = 6
-RL_FIB_BIN = 8
-RL_HOLD_BIN = 8
-RL_PROG_BIN = 8
+RL_ERR_BIN = 8
+RL_VEL_BIN = 6
+RL_FISHDELTA_BIN = 5
+RL_FIB_BIN = 6
+RL_HOLD_BIN = 6
+RL_PROG_BIN = 6
+
+RL_LOG_STEP_REWARD = True
+RL_LOG_STEP_INTERVAL = 1
 
 PD_RECORD = False
 PD_DATA_DIR = os.path.join(BASE_DIR, "imitation", "data")
