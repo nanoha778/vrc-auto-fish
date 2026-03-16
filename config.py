@@ -157,11 +157,11 @@ IL_PRESS_THRESH = 0.50
 RL_ENABLE = True
 RL_MODEL_PATH = os.path.join(BASE_DIR, "rl_hold_qtable.pkl")
 
-RL_EPSILON = 0.05
+RL_EPSILON = 0.25
 RL_ALPHA = 0.05
 RL_GAMMA = 0.96
 # PD hold に対して加える補正候補（秒）
-RL_HOLD_ACTIONS = [-0.015, -0.008, 0.0, 0.008, 0.015]
+RL_HOLD_ACTIONS = [-0.05, -0.03, -0.015, -0.008, 0, 0.008, 0.015, 0.03, 0.05]
 
 # 終端報酬
 RL_SUCCESS_REWARD = 3.5
