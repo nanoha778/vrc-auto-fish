@@ -114,17 +114,22 @@ class InputController:
             osc.send_message("/input/LookRight", 1)
             time.sleep(t)
             osc.send_message("/input/LookRight", 0)
-            time.sleep(0.2)
+            time.sleep(0.5)
 
             osc.send_message("/input/LookLeft", 1)
-            time.sleep(t)
+            time.sleep(t * 2)
             osc.send_message("/input/LookLeft", 0)
-            time.sleep(0.2)
+            time.sleep(0.5)
+            
+            osc.send_message("/input/LookRight", 1)
+            time.sleep(t)
+            osc.send_message("/input/LookRight", 0)
+            time.sleep(0.5)
+            
         except Exception:
             self._osc = None   # 发送失败时重置, 下次重新创建
 
     def look_right_for(self, seconds: float = 0.3):
-        """OSCで一定時間だけ右を向く。"""
         if seconds <= 0:
             return
         try:
@@ -139,7 +144,6 @@ class InputController:
             self._osc = None
 
     def look_left_for(self, seconds: float = 0.5):
-        """OSCで一定時間だけ左を向く。"""
         if seconds <= 0:
             return
         try:

@@ -37,37 +37,57 @@ _yolo_device_used = None
 class OnlineHoldRL:
     """
     高品質PDが出した base_hold に対して、
-    delta_hold だけを学習する超軽量オンラインQ学習器。
+    delta_hold だけを学習する超軽量オンラインDouble Q学習器。
+    replay buffer 対応。
     """
 
     def __init__(self):
-        self.actions = list(getattr(config, "RL_HOLD_ACTIONS", [-0.03, -0.015, -0.008, 0.0, 0.008, 0.015, 0.03]))
+        self.actions = list(getattr(
+            config,
+            "RL_HOLD_ACTIONS",
+            [-0.05, -0.03, -0.015, -0.008, 0, 0.008, 0.015, 0.03, 0.05]
+        ))
         self.alpha = float(getattr(config, "RL_ALPHA", 0.08))
         self.gamma = float(getattr(config, "RL_GAMMA", 0.96))
-        self.epsilon = float(getattr(config, "RL_EPSILON", 0.08))
-        self.q = {}
+        self.epsilon = float(getattr(config, "RL_EPSILON", 0.25))
+
+        # Double Q
+        self.q1 = {}
+        self.q2 = {}
 
         self.last_state = None
         self.last_action = None
+
+        # replay buffer
+        self.replay = deque(maxlen=int(getattr(config, "RL_REPLAY_SIZE", 5000)))
+        self.replay_batch = int(getattr(config, "RL_REPLAY_BATCH", 8))
+        self.replay_warmup = int(getattr(config, "RL_REPLAY_WARMUP", 200))
 
         self._load()
 
     def _key(self, state):
         return tuple(state)
 
-    def _ensure(self, s):
+    def _ensure_one(self, table, s):
         k = self._key(s)
-        if k not in self.q:
-            self.q[k] = [0.0 for _ in self.actions]
+        if k not in table:
+            table[k] = [0.0 for _ in self.actions]
         return k
 
+    def _ensure_both(self, s):
+        k1 = self._ensure_one(self.q1, s)
+        k2 = self._ensure_one(self.q2, s)
+        return k1, k2
+
     def act(self, state):
-        k = self._ensure(state)
+        k1, k2 = self._ensure_both(state)
+
+        # 行動選択は Q1+Q2 の合算で行う
+        qv = [self.q1[k1][i] + self.q2[k2][i] for i in range(len(self.actions))]
 
         if random.random() < self.epsilon:
             a = random.randrange(len(self.actions))
         else:
-            qv = self.q[k]
             mx = max(qv)
             best = [i for i, v in enumerate(qv) if v == mx]
             a = random.choice(best)
@@ -76,19 +96,58 @@ class OnlineHoldRL:
         self.last_action = a
         return self.actions[a], a
 
+    def _update_transition(self, state, action, reward, next_state, done=False):
+        """
+        Double Q-learning 更新
+        50%でQ1を更新、50%でQ2を更新
+        """
+        s1, s2 = self._ensure_both(state)
+        ns1, ns2 = self._ensure_both(next_state)
+
+        if done:
+            target = reward
+            if random.random() < 0.5:
+                q_old = self.q1[s1][action]
+                self.q1[s1][action] = q_old + self.alpha * (target - q_old)
+            else:
+                q_old = self.q2[s2][action]
+                self.q2[s2][action] = q_old + self.alpha * (target - q_old)
+            return
+
+        if random.random() < 0.5:
+            # Q1 を更新: 行動選択はQ1、評価はQ2
+            a_star = max(range(len(self.actions)), key=lambda i: self.q1[ns1][i])
+            target = reward + self.gamma * self.q2[ns2][a_star]
+            q_old = self.q1[s1][action]
+            self.q1[s1][action] = q_old + self.alpha * (target - q_old)
+        else:
+            # Q2 を更新: 行動選択はQ2、評価はQ1
+            a_star = max(range(len(self.actions)), key=lambda i: self.q2[ns2][i])
+            target = reward + self.gamma * self.q1[ns1][a_star]
+            q_old = self.q2[s2][action]
+            self.q2[s2][action] = q_old + self.alpha * (target - q_old)
+
     def update(self, reward, next_state, done=False):
         if self.last_state is None or self.last_action is None:
             return
 
-        s = self._ensure(self.last_state)
-        ns = self._ensure(next_state)
+        state = self.last_state
+        action = self.last_action
+        next_state = tuple(next_state)
 
-        q_old = self.q[s][self.last_action]
-        q_next = 0.0 if done else max(self.q[ns])
+        # 今回の遷移をその場学習
+        self._update_transition(state, action, reward, next_state, done)
 
-        self.q[s][self.last_action] = q_old + self.alpha * (
-            reward + self.gamma * q_next - q_old
-        )
+        # replay buffer に保存
+        self.replay.append((state, action, reward, next_state, done))
+
+        # 過去経験も再学習
+        if len(self.replay) >= self.replay_warmup:
+            batch_n = min(self.replay_batch, len(self.replay))
+            samples = random.sample(self.replay, batch_n)
+
+            for s, a, r, ns, d in samples:
+                self._update_transition(s, a, r, ns, d)
 
         if done:
             self.last_state = None
@@ -98,14 +157,17 @@ class OnlineHoldRL:
         path = getattr(config, "RL_MODEL_PATH", None)
         if not path:
             return
+
         try:
             with open(path, "wb") as f:
                 pickle.dump({
-                    "q": self.q,
+                    "q1": self.q1,
+                    "q2": self.q2,
                     "actions": self.actions,
                     "alpha": self.alpha,
                     "gamma": self.gamma,
                     "epsilon": self.epsilon,
+                    "double_q": True,
                 }, f)
         except Exception as e:
             log.warning(f"[RL] save失敗: {e}")
@@ -114,16 +176,90 @@ class OnlineHoldRL:
         path = getattr(config, "RL_MODEL_PATH", None)
         if not path or not os.path.exists(path):
             return
+
         try:
             with open(path, "rb") as f:
                 d = pickle.load(f)
-            self.q = d.get("q", {})
-            if "actions" in d:
-                self.actions = d["actions"]
-            log.info(f"[RL] Q-table 読み込み完了: {path} states={len(self.q)}")
+
+            loaded_actions = d.get("actions", None)
+            if loaded_actions is not None and list(loaded_actions) != list(self.actions):
+                log.warning(
+                    "[RL] actions が現在設定と一致しないため、"
+                    "既存Q-tableは読み込まず新規学習を開始します "
+                    f"(saved={loaded_actions}, current={self.actions})"
+                )
+                self.q1 = {}
+                self.q2 = {}
+                return
+
+            # 新形式: q1/q2
+            if "q1" in d and "q2" in d:
+                raw_q1 = d.get("q1", {})
+                raw_q2 = d.get("q2", {})
+
+                cleaned_q1 = {}
+                cleaned_q2 = {}
+                bad_count = 0
+
+                all_keys = set(raw_q1.keys()) | set(raw_q2.keys())
+                for k in all_keys:
+                    v1 = raw_q1.get(k)
+                    v2 = raw_q2.get(k)
+
+                    ok1 = isinstance(v1, list) and len(v1) == len(self.actions)
+                    ok2 = isinstance(v2, list) and len(v2) == len(self.actions)
+
+                    if ok1 and ok2:
+                        cleaned_q1[k] = v1
+                        cleaned_q2[k] = v2
+                    else:
+                        bad_count += 1
+
+                if bad_count > 0:
+                    log.warning(f"[RL] action数不一致のstateを {bad_count} 件破棄しました")
+
+                self.q1 = cleaned_q1
+                self.q2 = cleaned_q2
+
+                log.info(
+                    f"[RL] Double Q-table 読み込み完了: {path} "
+                    f"states={len(self.q1)}"
+                )
+                return
+
+            # 旧形式: q だけ
+            loaded_q = d.get("q", None)
+            if loaded_q is not None:
+                cleaned_q = {}
+                bad_count = 0
+
+                for k, v in loaded_q.items():
+                    if isinstance(v, list) and len(v) == len(self.actions):
+                        cleaned_q[k] = v
+                    else:
+                        bad_count += 1
+
+                if bad_count > 0:
+                    log.warning(f"[RL] action数不一致のstateを {bad_count} 件破棄しました")
+
+                # 旧single QをDouble Qへ移行
+                # Q1=旧Q, Q2=旧Qのコピーで開始
+                self.q1 = {k: list(v) for k, v in cleaned_q.items()}
+                self.q2 = {k: list(v) for k, v in cleaned_q.items()}
+
+                log.info(
+                    f"[RL] 旧single Q-table を Double Q に変換して読み込みました: "
+                    f"{path} states={len(self.q1)}"
+                )
+                return
+
+            # どちらも無い
+            self.q1 = {}
+            self.q2 = {}
+            log.warning("[RL] 読み込めるQ-table形式が無かったため新規学習を開始します")
+
         except Exception as e:
             log.warning(f"[RL] load失敗: {e}")
-
 
 def _get_yolo_detector(force_reload=False):
     """
@@ -171,6 +307,7 @@ class FishingBot:
         self.screen   = ScreenCapture()
         self.detector = ImageDetector(config.IMG_DIR, config.TEMPLATE_FILES)
         self.input    = InputController(self.window)
+        
 
         # YOLO検出器
         self.yolo = None
@@ -248,6 +385,8 @@ class FishingBot:
         # ── 未検出ベースの頭向き補正状態 ──
         self._no_minigame_streak = 0
         self._no_minigame_adjust_active = False
+        self._head_adjust_accum_sec = 0.0
+        self._consecutive_fail = 0
 
         # ── 行動クローニング（Imitation Learning） ──
         self._il_history = deque(maxlen=config.IL_HISTORY_LEN)
@@ -639,9 +778,18 @@ class FishingBot:
         if config.IL_RECORD:
             log.info("[🎣 投竿] 録画モード — 手動で竿を投げてください（マウスクリック）")
         else:
-            log.info("[🎣 投竿] 首振り → 投竿...")
-            self.input.shake_head()
-            time.sleep(0.15)
+            shake_th = getattr(config, "SHAKE_HEAD_FAIL_THRESHOLD", 5)
+
+            if self._consecutive_fail >= shake_th:
+                log.warning(
+                    f"[🎯 視点補正] 連続失敗 {self._consecutive_fail} 回 "
+                    f"(閾値 {shake_th}) のため首振りします"
+                )
+                self.input.shake_head()
+                time.sleep(0.15)
+                self._consecutive_fail = 0
+
+            log.info("[🎣 投竿] 投竿...")
             self.input.click()
 
         # ★ 投竿開始時点から debug ウィンドウを表示
@@ -653,18 +801,10 @@ class FishingBot:
 
         time.sleep(config.CAST_DELAY)
 
+
     # ───────────────── 頭向き補正の更新 ──────────────────
 
     def _update_section_head_adjust(self, no_minigame: bool):
-        """
-        連続未検出ベースの頭向き補正。
-
-        仕様:
-        - _verify_minigame() が False のときだけ「未検出」と数える
-        - 未検出が閾値以上になったら補正モード開始
-        - 補正モード中は、未検出のたびに毎回左へ step_sec 回す
-        - 一度でもミニゲーム検出できたら streak をリセットし、補正モード終了
-        """
         if not getattr(config, "ENABLE_SECTION_HEAD_ADJUST", False):
             return
 
@@ -689,6 +829,7 @@ class FishingBot:
 
                 log.info(f"[頭向き補正] 左へ {step_sec:.1f}s 補正を入れます")
                 self.input.look_left_for(step_sec)
+                self._head_adjust_accum_sec += step_sec
 
         else:
             if self._no_minigame_streak > 0 or self._no_minigame_adjust_active:
@@ -696,6 +837,13 @@ class FishingBot:
                     f"[頭向き補正] ミニゲーム検出を確認。"
                     f"未検出カウント {self._no_minigame_streak} をリセットします"
                 )
+
+            if self._head_adjust_accum_sec > 0:
+                log.info(
+                    f"[頭向き補正] 右へ {self._head_adjust_accum_sec:.2f}s 戻します"
+                )
+                self.input.look_right_for(self._head_adjust_accum_sec)
+                self._head_adjust_accum_sec = 0.0
 
             self._no_minigame_streak = 0
             self._no_minigame_adjust_active = False
@@ -1874,8 +2022,8 @@ class FishingBot:
             last_values = list(green_history)
 
             if last_values:
-                # ★ 最後40%のフレームを切り捨て
-                cut = int(len(last_values) * 0.4)
+                # ★ 最後20%のフレームを切り捨て
+                cut = int(len(last_values) * 0.2)
                 trimmed = last_values[:-cut] if cut > 0 else last_values
 
                 avg_green = sum(trimmed) / len(trimmed)
@@ -1910,7 +2058,7 @@ class FishingBot:
                     f"[❌ 失敗] avg {avg_green:.0%} <= {config.SUCCESS_PROGRESS:.0%} "
                     f"(max={max_green:.0%})"
                 )
-                        # ── RL終端学習 ──
+            # ── RL終端学習 ──
             if self._rl is not None:
                 terminal_reward = (
                     getattr(config, "RL_SUCCESS_REWARD", 2.5)
@@ -2741,12 +2889,20 @@ class FishingBot:
             improve = prev_abs_error - abs_error
             reward += improve * getattr(config, "RL_REWARD_CENTER_GAIN", 0.10) / 50.0
 
-        # progress増加
+        # progress 上昇/下降の差分報酬
         dprog = progress - self._rl_prev_progress
-        reward += dprog * getattr(config, "RL_REWARD_PROGRESS_GAIN", 0.20)
+        if dprog > 0:
+            reward += dprog * getattr(config, "RL_REWARD_PROGRESS_UP", 0.80)
+        elif dprog < 0:
+            reward += dprog * getattr(config, "RL_REWARD_PROGRESS_DOWN", 0.35)
+
+        # 高進捗帯の継続ボーナス
+        if progress >= getattr(config, "RL_PROGRESS_HIGH_TH", 0.85):
+            reward += getattr(config, "RL_REWARD_PROGRESS_HIGH", 0.05)
+        elif progress >= getattr(config, "RL_PROGRESS_MID_TH", 0.60):
+            reward += getattr(config, "RL_REWARD_PROGRESS_MID", 0.02)
 
         return float(reward)
-
     def _control_mouse(self, fish, bar, sr) -> bool:
         """
         高品質PD + residual RL
@@ -2991,6 +3147,7 @@ class FishingBot:
                         result = False
                         self.fish_count += 1
                         self.fail_count += 1
+                        self._consecutive_fail += 1
 
                         # 未検出ベースで頭向き補正更新
                         self._update_section_head_adjust(True)
@@ -3016,9 +3173,11 @@ class FishingBot:
                 self.fish_count += 1
                 if result:
                     self.success_count += 1
+                    self._consecutive_fail = 0
                     tag = "成功 ✅"
                 else:
                     self.fail_count += 1
+                    self._consecutive_fail += 1
                     tag = "失敗 ❌"
 
                 log.info(

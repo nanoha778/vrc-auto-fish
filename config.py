@@ -34,23 +34,23 @@ HOTKEY_DEBUG  = "F11"
 # ═══════════════════════════════════════════════════════════
 #  時間パラメータ（秒）
 # ═══════════════════════════════════════════════════════════
-CAST_DELAY          = 1.0         # 投竿後の待機
+CAST_DELAY          = 0.3         # 投竿後の待機
 BITE_TIMEOUT        = 60.0        # 最大待機時間（絶対上限）
-BITE_FORCE_HOOK     = 0.500       # N秒間ヒットなし → 強制的に合わせてミニゲームへ（検出漏れ対策）
+BITE_FORCE_HOOK     = 0.3         # N秒間ヒットなし → 強制的に合わせてミニゲームへ（検出漏れ対策）
 BITE_CHECK_INTERVAL = 0.15        # ヒット判定のチェック間隔
-MIN_BITE_WAIT       = 1.0         # 最低N秒待ってからヒット検出開始（誤検出防止）
+MIN_BITE_WAIT       = 0.2         # 最低N秒待ってからヒット検出開始（誤検出防止）
 COLOR_BITE_WAIT     = 6.0         # N秒後に色検出を有効化（テンプレート優先）
 COLOR_BITE_PIXELS   = 500         # 色検出の最小ピクセル数（高いほど厳しい）
 HOOK_PRE_DELAY      = 0.1         # 合わせ前の遅延
-HOOK_POST_DELAY     = 0.4         # 合わせ後 UI 出現待機
+HOOK_POST_DELAY     = 0.2         # 合わせ後 UI 出現待機
 VERIFY_TIMEOUT      = 1.0         # ミニゲームUI出現確認のタイムアウト
 VERIFY_CONSECUTIVE  = 1           # 連続Nフレーム検出で確定
 GAME_LOOP_INTERVAL  = 0.005       # ミニゲームループ間隔（できるだけ高速）
-SHOW_DEBUG             = True     # debugウィンドウ表示（OFFで高速化）
+SHOW_DEBUG             = False    # debugウィンドウ表示（OFFで高速化）
 DEBUG_OVERLAY_INTERVAL = 0.033    # debugウィンドウ更新間隔
 DEBUG_OVERLAY_MAX_W    = 1920     # debug最大幅
 DEBUG_OVERLAY_MAX_H    = 1080     # debug最大高さ
-TRACK_LOST_LIMIT    = 20          # Nフレーム魚＋バー消失 → ゲーム終了
+TRACK_LOST_LIMIT    = 30          # Nフレーム魚＋バー消失 → ゲーム終了
 FISH_LOST_LIMIT     = 60          # 魚がNフレーム消失 → 終了の可能性
 SINGLE_OBJ_TIMEOUT  = 5.0         # 魚またはバー単独消失 N秒 → 失敗
 OBJ_MIN_COUNT       = 1           # 1オブジェクト以上検出で継続
@@ -62,8 +62,10 @@ SUCCESS_PROGRESS    = 0.42        # この進捗以上で成功判定
 MINIGAME_TIMEOUT    = 480.0       # ミニゲーム最大時間
 UI_CHECK_FRAMES     = 10          # NフレームごとにUI確認
 UI_GONE_LIMIT       = 1           # UI消失N回で終了
-SUCCESS_CLICK_DELAY = 0.5         # 成功後クリックまでの待機
+SUCCESS_CLICK_DELAY = 0.3         # 成功後クリックまでの待機
 POST_RELEASE_DELAY  = 0.3         # 竿を放してから次の行動までの待機 
+ENABLE_SHAKE_HEAD = False
+SHAKE_HEAD_FAIL_THRESHOLD = 3
 
 ENABLE_SECTION_HEAD_ADJUST = True
 HEAD_ADJUST_FAIL_THRESHOLD = 10
@@ -180,6 +182,10 @@ RL_FISHDELTA_BIN = 5
 RL_FIB_BIN = 6
 RL_HOLD_BIN = 6
 RL_PROG_BIN = 6
+
+RL_REPLAY_SIZE = 5000
+RL_REPLAY_BATCH = 8
+RL_REPLAY_WARMUP = 200
 
 RL_LOG_STEP_REWARD = True
 RL_LOG_STEP_INTERVAL = 1
