@@ -1260,7 +1260,7 @@ class FishingBot:
         _prev_green = 0.0
 
         # ── 成功判定用: 終了直前60フレームの進捗履歴 ──
-        green_history = deque(maxlen=20)
+        green_history = deque(maxlen=60)
 
         # ── 直前10フレーム補完用バッファ ──
         recent_fish = deque(maxlen=10)
@@ -2026,8 +2026,8 @@ class FishingBot:
             last_values = list(green_history)
 
             if last_values:
-                # ★ 最後20%のフレームを切り捨て
-                cut = int(len(last_values) * 0.2)
+                # ★ 最後30%のフレームを切り捨て
+                cut = int(len(last_values) * 0.3)
                 trimmed = last_values[:-cut] if cut > 0 else last_values
 
                 avg_green = sum(trimmed) / len(trimmed)
