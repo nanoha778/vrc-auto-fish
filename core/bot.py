@@ -2887,6 +2887,7 @@ class FishingBot:
         progress,
         prev_abs_error,
         prev_delta_hold=0.0,
+        error_px=0.0,
     ):
         reward = 0.0
 
@@ -2939,7 +2940,14 @@ class FishingBot:
             action_penalty *= 0.35
 
         reward -= abs(prev_delta_hold) * action_penalty
-
+        # 7) オーバーシュート罰
+        # error_px = bar_cy - fish_cy
+        # 正の値が大きいほど「バーが魚より下」
+        # 負の値が大きいほど「バーが魚より上」
+        overshoot_px = getattr(config, "RL_OVERSHOOT_PX", 8.0)
+        if error_px < -overshoot_px:
+            over = min(abs(error_px) - overshoot_px, 40.0)
+            reward -= getattr(config, "RL_OVERSHOOT_PENALTY", 0.10) * (over / 40.0)
         # 次フレーム用
         self._rl_prev_in_bar = in_bar
 
@@ -3037,6 +3045,7 @@ class FishingBot:
                     progress=self._pd_last_progress,
                     prev_abs_error=self._rl_prev_abs_error,
                     prev_delta_hold=self._rl_prev_delta_hold,
+                    error_px=(bar_cy - fish_cy),
                 )
                 self._rl_episode_reward += step_reward
                 self._rl_step_reward_sum += step_reward
@@ -3045,7 +3054,31 @@ class FishingBot:
                 # 今回の補正量を選ぶ
                 delta_hold, _ = self._rl.act(state)
 
-                # 補正幅を少し制限（PD補正として暴れにくくする）
+                # ── RL暴発上げ防止ガード ──
+
+                # 1) 正方向だけ弱める
+                if delta_hold > 0.0:
+                    delta_hold *= getattr(config, "RL_POSITIVE_SCALE", 0.65)
+                elif delta_hold < 0.0:
+                    delta_hold *= getattr(config, "RL_NEGATIVE_SCALE", 1.00)
+
+                # 2) 誤差が小さいときはRL補正をかなり弱める
+                small_err_px = getattr(config, "RL_SMALL_ERR_PX", 10.0)
+                if abs(bar_cy - fish_cy) <= small_err_px:
+                    delta_hold *= getattr(config, "RL_SMALL_ERR_SCALE", 0.35)
+
+                # 3) 魚がすでにバー上側寄りにいる時は、強い上方向補正を禁止
+                # fish_in_bar:
+                #   0.0 = バー上端
+                #   0.5 = 中央
+                #   1.0 = 下端
+                if getattr(config, "RL_DISABLE_STRONG_UP_IN_TOP", True):
+                    top_zone_fib = getattr(config, "RL_TOP_ZONE_FIB", 0.32)
+                    if fish_in_bar <= top_zone_fib and delta_hold > 0.0:
+                        up_clamp = getattr(config, "RL_STRONG_UP_CLAMP", 0.006)
+                        delta_hold = min(delta_hold, up_clamp)
+
+                # 4) 最終的なdeltaの上限
                 max_delta = getattr(config, "RL_MAX_DELTA_HOLD", 0.020)
                 delta_hold = max(-max_delta, min(max_delta, delta_hold))
 

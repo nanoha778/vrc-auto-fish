@@ -116,16 +116,22 @@ class InputController:
             osc.send_message("/input/LookRight", 0)
             time.sleep(0.5)
 
-            osc.send_message("/input/LookLeft", 1)
-            time.sleep(t)
-            osc.send_message("/input/LookLeft", 0)
-            time.sleep(0.5)
-            
+            self.click_rapid()
+
             osc.send_message("/input/LookLeft", 1)
             time.sleep(t)
             osc.send_message("/input/LookLeft", 0)
             time.sleep(0.5)
 
+            self.click_rapid()
+
+            osc.send_message("/input/LookLeft", 1)
+            time.sleep(t)
+            osc.send_message("/input/LookLeft", 0)
+            time.sleep(0.5)
+
+            self.click_rapid()
+            
             osc.send_message("/input/LookRight", 1)
             time.sleep(t)
             osc.send_message("/input/LookRight", 0)

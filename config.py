@@ -159,12 +159,12 @@ IL_PRESS_THRESH = 0.50
 RL_ENABLE = True
 RL_MODEL_PATH = os.path.join(BASE_DIR, "rl_hold_qtable.pkl")
 
-RL_EPSILON = 0.10
+RL_EPSILON = 0.25
 RL_ALPHA = 0.05
 RL_GAMMA = 0.96
 
 # PD hold に対して加える補正候補（秒）
-RL_HOLD_ACTIONS = [-0.1, -0.08, -0.05, -0.03, -0.015, -0.008, 0, 0.008, 0.015, 0.03, 0.05, 0.08, 0.1]
+RL_HOLD_ACTIONS = [-0.05, -0.03, -0.015, -0.008, 0, 0.008, 0.015, 0.03, 0.05]
 
 # 終端報酬
 RL_SUCCESS_REWARD = 4.5
@@ -200,6 +200,18 @@ RL_REPLAY_WARMUP = 200
 RL_LOG_STEP_REWARD = True
 RL_LOG_STEP_INTERVAL = 1
 
+# ── RL暴発上げ防止ガード ──
+RL_POSITIVE_SCALE = 0.65              # 正方向deltaを全体的に弱める
+RL_NEGATIVE_SCALE = 1.00              # 負方向deltaはそのまま
+RL_SMALL_ERR_PX = 10.0                # 誤差が小さい時はRL補正を縮小
+RL_SMALL_ERR_SCALE = 0.35             # 小誤差時の補正倍率
+RL_TOP_ZONE_FIB = 0.32                # 魚がバー上側寄りにいる判定
+RL_DISABLE_STRONG_UP_IN_TOP = True    # 上側では強い上方向補正を禁止
+RL_STRONG_UP_CLAMP = 0.006            # 上側で許容する上方向delta上限（秒）
+RL_OVERSHOOT_PENALTY = 0.10           # バーが魚より上に行きすぎた時の追加罰
+RL_OVERSHOOT_PX = 8.0                 # オーバーシュートとみなすpx
+
+# ── PD制御データ記録 ──
 PD_RECORD = False
 PD_DATA_DIR = os.path.join(BASE_DIR, "imitation", "data")
 
