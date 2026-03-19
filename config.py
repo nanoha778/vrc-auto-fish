@@ -159,7 +159,7 @@ IL_PRESS_THRESH = 0.50
 RL_ENABLE = True
 RL_MODEL_PATH = os.path.join(BASE_DIR, "rl_hold_qtable.pkl")
 
-RL_EPSILON = 0.25
+RL_EPSILON = 0.10
 RL_ALPHA = 0.05
 RL_GAMMA = 0.96
 

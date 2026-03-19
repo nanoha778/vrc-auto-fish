@@ -561,26 +561,26 @@ class FishingApp:
     def _reset_params(self):
         """恢复所有参数到默认值并删除配置文件"""
         defaults = {
-            "BITE_FORCE_HOOK":  0.500,
+            "BITE_FORCE_HOOK":  20.0,
             "FISH_GAME_SIZE":   30,
             "DEAD_ZONE":        12,
             "HOLD_MIN_S":       0.015,
-            "HOLD_MAX_S":       0.100,
-            "HOLD_GAIN":        0.040,
-            "PREDICT_AHEAD":    0.400,
+            "HOLD_MAX_S":       0.220,
+            "HOLD_GAIN":        0.055,
+            "PREDICT_AHEAD":    0.220,
             "SPEED_DAMPING":    0.00025,
             "MAX_FISH_BAR_DIST": 300,
-            "VELOCITY_SMOOTH":  0.5,
+            "VELOCITY_SMOOTH":  0.3,
             "TRACK_MIN_ANGLE":  3.0,
             "TRACK_MAX_ANGLE":  45.0,
             "REGION_UP":        300,
             "REGION_DOWN":      400,
             "REGION_X":         100,
-            "POST_CATCH_DELAY": 2.800,
+            "POST_CATCH_DELAY": 0.500,
             "SHAKE_HEAD_TIME":  0.0300,
             "INITIAL_PRESS_TIME": 0.2,
             "VERIFY_CONSECUTIVE": 1,
-            "SUCCESS_PROGRESS": 0.42,
+            "SUCCESS_PROGRESS": 0.48,
         }
 
         for attr, default_val in defaults.items():

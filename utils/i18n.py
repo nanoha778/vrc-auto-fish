@@ -386,7 +386,7 @@ def remove_listener(callback):
 # 可调参数的翻译（按语言）
 TUNABLE_PARAMS_I18N = {
     "zh": [
-        ("强制提竿(s)",   "BITE_FORCE_HOOK",  "float", "等待N秒无咬钩则强制提竿进入小游戏"),
+        ("强制提竿(s)",   "BITE_FORCE_HOOK",  "float", "从抛竿到鱼儿咬钩的等待时间"),
         ("鱼像素大小",    "FISH_GAME_SIZE",   "int",   "游戏内鱼图标的大致像素,越小搜索倍率越高"),
         ("死区(px)",      "DEAD_ZONE",        "int",   "越大越容易触发按住"),
         ("抗重力基准(ms)","HOLD_MIN_S",       "ms",    "越小下降越快,越大越悬浮"),
@@ -408,7 +408,7 @@ TUNABLE_PARAMS_I18N = {
         ("成功阈值(%)",   "SUCCESS_PROGRESS", "pct",   "进度条超过此百分比判定钓鱼成功"),
     ],
     "en": [
-        ("Force Hook(s)",   "BITE_FORCE_HOOK",  "float", "Wait N seconds then force hook"),
+        ("Hook Wait(s)",   "BITE_FORCE_HOOK",  "float", "Wait time from cast to bites"),
         ("Fish Size(px)",    "FISH_GAME_SIZE",   "int",   "Approximate fish icon size in game"),
         ("Dead Zone(px)",      "DEAD_ZONE",        "int",   "Larger = easier to trigger hold"),
         ("Min Hold(ms)","HOLD_MIN_S",       "ms",    "Smaller = fall faster"),
@@ -430,7 +430,7 @@ TUNABLE_PARAMS_I18N = {
         ("Success(%)",   "SUCCESS_PROGRESS", "pct",   "Progress threshold for success"),
     ],
     "jp": [
-        ("強制フック(s)",   "BITE_FORCE_HOOK",  "float", "N秒待って強制フック"),
+        ("フック待機(s)",   "BITE_FORCE_HOOK",  "float", "投竿後ヒットまでの待機時間"),
         ("魚サイズ(px)",    "FISH_GAME_SIZE",   "int",   "ゲーム内魚アイコンの概算サイズ"),
         ("デッドゾーン(px)",      "DEAD_ZONE",        "int",   "大きいほどホールドしやすい"),
         ("最小ホールド(ms)","HOLD_MIN_S",       "ms",    "小さいほど速く落下"),
